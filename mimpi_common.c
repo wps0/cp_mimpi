@@ -14,6 +14,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+const char* MIMPI_ENV_RANK = "MIMPI_ENV_RANK";
+const char* MIMPI_ENV_WORLD_SIZE = "MIMPI_ENV_WORLD_SIZE";
+const int MAX_RANK = 16;
+
 _Noreturn void syserr(const char* fmt, ...)
 {
     va_list fmt_args;
@@ -44,3 +48,17 @@ _Noreturn void fatal(const char* fmt, ...)
 /////////////////////////////////////////////////
 // Put your implementation here
 
+void log_info(const char* fmt, ...) {
+    static const char* fmt_prefix = "MIMPI (%s at %s:%d): ";
+
+    char* fmt_buf = malloc(sizeof(char) * (strlen(fmt_prefix) + strlen(fmt)) + 1);
+    strcpy(fmt_buf, fmt_prefix);
+    strcat(fmt_buf, fmt);
+
+    va_list fmt_args;
+    va_start(fmt_args, fmt);
+    vfprintf(stderr, fmt_buf, fmt_args);
+    va_end(fmt_args);
+
+    free(fmt_buf);
+}

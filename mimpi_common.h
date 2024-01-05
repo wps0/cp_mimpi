@@ -48,7 +48,25 @@ _Noreturn extern void fatal(const char* fmt, ...);
 /////////////////////////////////////////////
 // Put your declarations here
 
+#define ASSERT_NON_NEGATIVE(expr) \
+    {                                                                                   \
+        int const _errno = (expr);                                                         \
+        if (_errno < 0)                                                                   \
+            fatal(                                                                        \
+                "Failed: %s\n\tIn function %s() in %s line %d.\n\tErrno: ",                \
+                #expr, __func__, __FILE__, __LINE__                                        \
+            );                                                                             \
+    }
 
+#define LOG(fmt, ...) log_info(fmt, __func__, __FILE__, __LINE__, __VA_ARGS__)
+
+
+void log_info(const char* fmt, ...);
+
+extern const char* MIMPI_ENV_RANK;
+extern const char* MIMPI_ENV_WORLD_SIZE;
+
+extern const int MAX_RANK;
 
 
 

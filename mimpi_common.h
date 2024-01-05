@@ -49,14 +49,24 @@ _Noreturn extern void fatal(const char* fmt, ...);
 // Put your declarations here
 
 #define ASSERT_NON_NEGATIVE(expr) \
-    {                                                                                   \
-        int const _errno = (expr);                                                         \
-        if (_errno < 0)                                                                   \
-            fatal(                                                                        \
-                "Failed: %s\n\tIn function %s() in %s line %d.\n\tErrno: ",                \
-                #expr, __func__, __FILE__, __LINE__                                        \
-            );                                                                             \
+    {                                                                                    \
+        int const _errno = (expr);                                                       \
+        if (_errno < 0)                                                                  \
+            fatal(                                                                       \
+                "Failed: %s\n\tIn function %s() in %s line %d.\n\tErrno: ",              \
+                #expr, __func__, __FILE__, __LINE__                                      \
+            );                                                                           \
     }
+
+#define ASSERT_ERRNO_OK                                                                  \
+    {                                                                                    \
+        if (errno != 0)                                                                  \
+            fatal(                                                                       \
+                "Failed: \n\tIn function %s() in %s line %d.\n\tErrno: ",              \
+                __func__, __FILE__, __LINE__                                      \
+            );                                                                           \
+    }
+
 
 #define LOG(fmt, ...) log_info(fmt, __func__, __FILE__, __LINE__, __VA_ARGS__)
 

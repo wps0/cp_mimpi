@@ -67,16 +67,20 @@ _Noreturn extern void fatal(const char* fmt, ...);
             );                                                                           \
     }
 
-
 #define LOG(fmt, ...) log_info(fmt, __func__, __FILE__, __LINE__, __VA_ARGS__)
+#define INBOUND_IF_FD(rank) (INTERFACES_FD_OFFSET + (rank) * 2 + 1)
+#define OUTBOUND_IF_FD(rank) (INTERFACES_FD_OFFSET + (rank) * 2)
 
-
-void log_info(const char* fmt, ...);
+#define MAX_RANK 16
+#define MAX_FD_NUMBER 1023
+#define INTERFACES_FD_OFFSET (MAX_FD_NUMBER - (MAX_RANK) * 2)
 
 extern const char* MIMPI_ENV_RANK;
 extern const char* MIMPI_ENV_WORLD_SIZE;
 
-extern const int MAX_RANK;
+
+void log_info(const char* fmt, ...);
+void print_open_descriptors(void);
 
 
 

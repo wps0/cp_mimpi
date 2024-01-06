@@ -6,6 +6,7 @@
 #include <malloc.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <unistd.h>
 #include "channel.h"
 #include "mimpi.h"
 #include "mimpi_common.h"
@@ -43,6 +44,53 @@ static MIMPI_Instance *instance;
 
 // ----- helper functions
 
+void free_iface(MIMPI_If *iface) {
+    close(iface->outbound_fd);
+    close(iface->inbound_fd);
+}
+
+void init_ifaces(MIMPI_If *ifaces) {
+    for (int i = 0; i < instance->world_size; i++) {
+        if (i != instance->rank) {
+            ifaces[i].inbound_fd = INBOUND_IF_FD(i);
+            ifaces[i].outbound_fd = OUTBOUND_IF_FD(i);
+        }
+    }
+}
+
+void make_instance(bool enable_deadlock_detection) {
+    instance = calloc(1, sizeof(MIMPI_Instance));
+    instance->deadlock_detection = enable_deadlock_detection;
+
+    char *env_ptr;
+    env_ptr = getenv(MIMPI_ENV_RANK);
+    assert(env_ptr != NULL);
+    instance->rank = (int) strtol(env_ptr, NULL, 10);
+    ASSERT_ERRNO_OK
+
+    env_ptr = getenv(MIMPI_ENV_WORLD_SIZE);
+    assert(env_ptr != NULL);
+    instance->world_size = (int) strtol(env_ptr, NULL, 10);
+    ASSERT_ERRNO_OK
+
+    instance->ifaces = calloc(instance->world_size, sizeof(MIMPI_If));
+    assert(instance->ifaces);
+}
+
+void free_instance(MIMPI_Instance **mimpiInstance) {
+    MIMPI_Instance *inst = *mimpiInstance;
+
+    // free interfaces
+    if (inst->ifaces != NULL) {
+        for (size_t i = 0; i < inst->world_size; i++)
+            free_iface(&inst->ifaces[i]);
+        free(inst->ifaces);
+    }
+
+    free(*mimpiInstance);
+    *mimpiInstance = NULL;
+}
+
 inline static size_t real_pdu_size(MIMPI_PDU const* pdu) {
     static const size_t PDU_WITHOUT_DATA_LENGTH = sizeof(*pdu) - MAX_PDU_DATA_LENGTH;
     return PDU_WITHOUT_DATA_LENGTH + pdu->length;
@@ -64,23 +112,12 @@ static void recv_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
 void MIMPI_Init(bool enable_deadlock_detection) {
     channels_init();
 
-    instance = calloc(1, sizeof(MIMPI_Instance));
-    instance->deadlock_detection = enable_deadlock_detection;
-
-    char *env_ptr;
-    env_ptr = getenv(MIMPI_ENV_RANK);
-    assert(env_ptr != NULL);
-    instance->rank = (int) strtol(env_ptr, NULL, 10);
-    ASSERT_ERRNO_OK
-
-    env_ptr = getenv(MIMPI_ENV_WORLD_SIZE);
-    assert(env_ptr != NULL);
-    instance->world_size = (int) strtol(env_ptr, NULL, 10);
-    ASSERT_ERRNO_OK
+    make_instance(enable_deadlock_detection);
+    init_ifaces(instance->ifaces);
 }
 
 void MIMPI_Finalize() {
-    TODO
+    free_instance(&instance);
 
     channels_finalize();
 }

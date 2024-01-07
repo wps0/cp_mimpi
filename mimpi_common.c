@@ -49,7 +49,7 @@ _Noreturn void fatal(const char* fmt, ...)
 // Put your implementation here
 
 void log_info(const char* fmt, ...) {
-    static const char* fmt_prefix = "MIMPI (%s at %s:%d): ";
+    static const char* fmt_prefix = "MIMPI =%d= (%s at %s:%d): ";
 
     char* fmt_buf = malloc(sizeof(char) * (strlen(fmt_prefix) + strlen(fmt)) + 1);
     strcpy(fmt_buf, fmt_prefix);

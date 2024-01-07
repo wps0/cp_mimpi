@@ -15,7 +15,6 @@
 #define MAX_PDU_DATA_LENGTH 256
 #define CHANNELS_MAX_ATOMIC_DATA_CHUNK 512
 #define PDU_SIZE_WITHOUT_DATA_LENGTH (sizeof(*pdu) - MAX_PDU_DATA_LENGTH)
-#define FD_PROCESS_ENDED -4
 #define EMPTY_MESSAGE_ID 0
 
 
@@ -89,6 +88,13 @@ static void init_buffer(MIMPI_Msg_Buffer *buf) {
     buf->last_pos = 0;
     buf->sz = 4;
     buf->data = safe_calloc(buf->sz, sizeof(MIMPI_Msg));
+}
+
+static void free_buffer(MIMPI_Msg_Buffer *buf) {
+    for (int i = 0; i < buf->sz; ++i)
+        if (buf->data[i].id != 0)
+            free(buf->data[i].data);
+    free(buf->data);
 }
 
 static void init_message_with_pdu(MIMPI_Msg *msg, MIMPI_PDU *pdu) {
@@ -231,6 +237,8 @@ void free_instance(MIMPI_Instance **mimpiInstance) {
         free(inst->ifaces);
     }
 
+    free_buffer((*mimpiInstance)->inbound_buf);
+    free((*mimpiInstance)->inbound_buf);
     free(*mimpiInstance);
     *mimpiInstance = NULL;
 }
@@ -268,32 +276,33 @@ MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) 
     pdu_seq_t seq = 0;
     int offset = 0;
     MIMPI_Retcode status = MIMPI_SUCCESS;
+    MIMPI_If *iface = &instance->ifaces[destination];
 
     while (offset < count) {
-        MIMPI_If *iface = &instance->ifaces[destination];
-        int chunk_size = min(offset + MAX_PDU_DATA_LENGTH, count);
+        int chunk_size = min(MAX_PDU_DATA_LENGTH, count - offset);
         MIMPI_PDU pdu = {
                 instance->rank,
                 tag,
                 iface->next_mid,
                 seq,
                 count,
-                chunk_size,
-                {0}
+                chunk_size
         };
 
-        memcpy(pdu.data, (char const*) data + offset, chunk_size);
+        memcpy(&pdu.data, (char const*) data + offset, chunk_size);
+        if (chunk_size < MAX_PDU_DATA_LENGTH)
+            memset(&pdu.data[chunk_size], 0, MAX_PDU_DATA_LENGTH - chunk_size);
 
         status = send_if(iface, &pdu);
         if (status != MIMPI_SUCCESS) {
             break;
         }
 
-        ++iface->next_mid;
         seq++;
-        offset += MAX_PDU_DATA_LENGTH;
+        offset += chunk_size;
     }
 
+    ++iface->next_mid;
     return status;
 }
 

@@ -15,21 +15,46 @@
 #define MAX_PDU_DATA_LENGTH 256
 #define CHANNELS_MAX_ATOMIC_DATA_CHUNK 512
 #define PDU_SIZE_WITHOUT_DATA_LENGTH (sizeof(*pdu) - MAX_PDU_DATA_LENGTH)
+#define EMPTY_MESSAGE_ID 0
 
 
 // ----- structures
 typedef uint32_t pdu_seq_t;
+typedef int tag_t;
+typedef uint8_t rank_t;
+
+/// Message id
+typedef uint32_t mid_t;
+
+typedef struct MIMPI_Msg {
+    mid_t id;
+    tag_t tag;
+    rank_t src;
+    size_t size;
+    size_t received_size;
+    uint8_t *data;
+} MIMPI_Msg;
+
+typedef struct MIMPI_Msg_Buffer {
+    size_t last_pos;
+    size_t sz;
+    MIMPI_Msg *data;
+} MIMPI_Msg_Buffer;
 
 typedef struct MIMPI_If {
     int inbound_fd, outbound_fd;
     // TODO: Queues
 } MIMPI_If;
 
+// TODO: włączyć sequence_Number w message id?
 typedef struct MIMPI_PDU {
-    uint8_t src;
-    int tag;
-    // Sequence number, as in TCP
+    rank_t src;
+    tag_t tag;
+    /// Message id
+    mid_t id;
+    /// Sequence number, as in TCP
     pdu_seq_t seq;
+    size_t total_length;
     uint16_t length;
     uint8_t data[MAX_PDU_DATA_LENGTH];
 } MIMPI_PDU;
@@ -45,6 +70,8 @@ typedef struct MIMPI_Instance {
 // ----- program data
 static MIMPI_Instance *instance;
 
+
+// -----------------------
 // ----- helper functions
 
 void free_iface(MIMPI_If *iface) {
@@ -94,10 +121,77 @@ void free_instance(MIMPI_Instance **mimpiInstance) {
     *mimpiInstance = NULL;
 }
 
-inline static size_t real_pdu_size(MIMPI_PDU const *pdu) {
-    return PDU_SIZE_WITHOUT_DATA_LENGTH + pdu->length;
+// ----- Network stack
+// --- Buffer
+static void init_message_with_pdu(MIMPI_Msg *msg, MIMPI_PDU *pdu) {
+    msg->id = pdu->id;
+    msg->tag = pdu->tag;
+    msg->src = pdu->src;
+    msg->size = pdu->total_length;
+    msg->received_size = 0;
+
+    msg->data = calloc(sizeof(uint8_t), msg->size);
+    ASSERT_ERRNO_OK
+    assert(msg->data);
 }
 
+inline static void insert_pdu_into_message(MIMPI_Msg *msg, MIMPI_PDU *pdu) {
+    memcpy(msg->data + pdu->seq * MAX_PDU_DATA_LENGTH, pdu->data, pdu->length);
+    msg->received_size += pdu->length;
+}
+
+inline static MIMPI_Msg_Buffer *buffer_enlarge(MIMPI_Msg_Buffer *buf) {
+    void *mem = realloc(buf, buf->sz * sizeof(MIMPI_Msg) * 2);
+    ASSERT_ERRNO_OK
+    assert(mem);
+    return mem;
+}
+
+static MIMPI_Msg *buffer_find_msg(MIMPI_Msg_Buffer *buf, mid_t id) {
+    for (size_t i = 0; i < buf->sz; i++)
+        if (buf->data[i].id == id)
+            return &buf->data[i];
+    return NULL;
+}
+
+static MIMPI_Msg *buffer_find_free(MIMPI_Msg_Buffer *buf) {
+    size_t starting_pos = buf->last_pos;
+    size_t *i = &buf->last_pos;
+
+    do {
+        if (buf->data[*i].id == 0)
+            return &buf->data[*i];
+
+        *i = (*i + 1) % buf->sz;
+    } while (*i != starting_pos);
+
+    return NULL;
+}
+
+static MIMPI_Msg_Buffer *buffer_put(MIMPI_Msg_Buffer *buf, MIMPI_PDU *pdu) {
+    MIMPI_Msg *msg = buffer_find_msg(buf, pdu->id);
+    if (msg == NULL) {
+        msg = buffer_find_free(buf);
+        if (msg == NULL) {
+            // The buffer has to be enlarged.
+            buf = buffer_enlarge(buf);
+        }
+
+        msg = buffer_find_free(buf);
+        init_message_with_pdu(msg, pdu);
+    }
+    insert_pdu_into_message(msg, pdu);
+
+    return buf;
+}
+
+inline static void buffer_del(MIMPI_Msg *msg) {
+    msg->id = EMPTY_MESSAGE_ID;
+    free(msg->data);
+    msg->data = NULL;
+}
+
+// --- General network
 static MIMPI_Retcode send_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
 //    size_t pdu_size = real_pdu_size(pdu);
 //    assert(pdu_size <= CHANNELS_MAX_ATOMIC_DATA_CHUNK);

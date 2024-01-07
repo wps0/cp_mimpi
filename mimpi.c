@@ -164,26 +164,24 @@ inline static void buffer_del(MIMPI_Msg *msg) {
     msg->data = NULL;
 }
 
-// --- General network
+// --- Receiver
+
+//static void *inbound_iface_handler(void *arg) {
+//    fd_set inbound_ifs;
+//    FD_ZERO(&inbound_ifs);
+//    while (true) {
+//        // select(...)
+//    }
+//}
+
+// --- Generic code
+
 static MIMPI_Retcode send_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
-//    size_t pdu_size = real_pdu_size(pdu);
-//    assert(pdu_size <= CHANNELS_MAX_ATOMIC_DATA_CHUNK);
-        int nbytes = chsend(iface->outbound_fd, pdu, sizeof(MIMPI_PDU));
+    int nbytes = chsend(iface->outbound_fd, pdu, sizeof(MIMPI_PDU));
     ASSERT_SYS_OK(nbytes);
     assert(nbytes == sizeof(*pdu));
     return MIMPI_SUCCESS;
 }
-
-/// PDU has to be at least MAX_PDU_DATA_LENGTH wide.
-//static MIMPI_Retcode recv_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
-//    while (count > 0) {
-//        int nbytes = chrecv(iface->inbound_fd, pdu, sizeof(MIMPI_PDU));
-//        ASSERT_SYS_OK(nbytes);
-//        assert(nbytes == MAX_PDU_DATA_LENGTH);
-//
-//    }
-//
-//}
 
 static MIMPI_Retcode validate_sendrecv_args() {
     return MIMPI_SUCCESS;

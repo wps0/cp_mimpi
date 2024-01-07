@@ -17,6 +17,9 @@
 #define PDU_SIZE_WITHOUT_DATA_LENGTH (sizeof(*pdu) - MAX_PDU_DATA_LENGTH)
 #define EMPTY_MESSAGE_ID 0
 
+#define _TAG_FIN -1
+#define _TAG_ENTERED_BARRIER -2
+
 
 // ----- structures
 typedef uint32_t pdu_seq_t;
@@ -63,6 +66,7 @@ typedef struct MIMPI_Instance {
     bool deadlock_detection;
     int rank;
     int world_size;
+    int finished;
 
     MIMPI_If *ifaces;
     MIMPI_Msg_Buffer *inbound_buf;
@@ -287,7 +291,8 @@ MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) 
                 chunk_size
         };
 
-        memcpy(&pdu.data, (char const*) data + offset, chunk_size);
+        if (data != NULL)
+            memcpy(&pdu.data, (char const*) data + offset, chunk_size);
         if (chunk_size < MAX_PDU_DATA_LENGTH)
             memset(&pdu.data[chunk_size], 0, MAX_PDU_DATA_LENGTH - chunk_size);
 

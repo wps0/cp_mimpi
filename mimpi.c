@@ -121,6 +121,7 @@ static MIMPI_Retcode send_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
 // ----- API
 
 void MIMPI_Init(bool enable_deadlock_detection) {
+    errno = 0;
     LOG("Initialising process with rank %s\n", getenv(MIMPI_ENV_RANK));
     channels_init();
 

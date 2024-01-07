@@ -61,9 +61,9 @@ _Noreturn extern void fatal(const char* fmt, ...);
 #define ASSERT_ERRNO_OK                                                                  \
     {                                                                                    \
         if (errno != 0)                                                                  \
-            fatal(                                                                       \
-                "Failed: \n\tIn function %s() in %s line %d.\n\tErrno: ",              \
-                __func__, __FILE__, __LINE__                                      \
+            syserr(                                                                       \
+                "Failed: \n\tIn function %s() in %s line %d.\n\tErrno:\n",      \
+                __func__, __FILE__, __LINE__                     \
             );                                                                           \
     }
 

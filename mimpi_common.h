@@ -42,7 +42,7 @@ _Noreturn extern void syserr(const char* fmt, ...);
 /* Prints (like printf) and quits. */
 _Noreturn extern void fatal(const char* fmt, ...);
 
-#define TODO fatal("UNIMPLEMENTED function %s", __PRETTY_FUNCTION__);
+#define TODO fatal("UNIMPLEMENTED function %s", __func__);
 
 
 /////////////////////////////////////////////
@@ -81,6 +81,7 @@ extern const char* MIMPI_ENV_WORLD_SIZE;
 
 void log_info(const char* fmt, ...);
 void print_open_descriptors(void);
+int min(int, int);
 
 
 

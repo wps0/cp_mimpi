@@ -80,7 +80,7 @@ static void run_workers(int count, char* prog_path, char** prog_argv) {
         if (w_pid == 0) {
             // child
             prepare_environment(i, count);
-            print_open_descriptors();
+//            print_open_descriptors();
             replace_process(prog_path, prog_argv);
         }
     }

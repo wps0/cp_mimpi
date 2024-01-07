@@ -7,15 +7,18 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <unistd.h>
+#include <memory.h>
 #include "channel.h"
 #include "mimpi.h"
 #include "mimpi_common.h"
 
 #define MAX_PDU_DATA_LENGTH 256
 #define CHANNELS_MAX_ATOMIC_DATA_CHUNK 512
+#define PDU_SIZE_WITHOUT_DATA_LENGTH (sizeof(*pdu) - MAX_PDU_DATA_LENGTH)
 
 
 // ----- structures
+typedef uint32_t pdu_seq_t;
 
 typedef struct MIMPI_If {
     int inbound_fd, outbound_fd;
@@ -23,10 +26,10 @@ typedef struct MIMPI_If {
 } MIMPI_If;
 
 typedef struct MIMPI_PDU {
-    uint8_t src, dst;
+    uint8_t src;
     int tag;
     // Sequence number, as in TCP
-    uint32_t seq;
+    pdu_seq_t seq;
     uint16_t length;
     uint8_t data[MAX_PDU_DATA_LENGTH];
 } MIMPI_PDU;
@@ -91,25 +94,34 @@ void free_instance(MIMPI_Instance **mimpiInstance) {
     *mimpiInstance = NULL;
 }
 
-inline static size_t real_pdu_size(MIMPI_PDU const* pdu) {
-    static const size_t PDU_WITHOUT_DATA_LENGTH = sizeof(*pdu) - MAX_PDU_DATA_LENGTH;
-    return PDU_WITHOUT_DATA_LENGTH + pdu->length;
+inline static size_t real_pdu_size(MIMPI_PDU const *pdu) {
+    return PDU_SIZE_WITHOUT_DATA_LENGTH + pdu->length;
 }
 
-static void send_if(MIMPI_If *iface, MIMPI_PDU *restrict pdu) {
-    size_t pdu_size = real_pdu_size(pdu);
-    assert(pdu_size <= CHANNELS_MAX_ATOMIC_DATA_CHUNK);
-    ASSERT_SYS_OK(chsend(iface->outbound_fd, pdu, pdu_size));
+static MIMPI_Retcode send_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
+//    size_t pdu_size = real_pdu_size(pdu);
+//    assert(pdu_size <= CHANNELS_MAX_ATOMIC_DATA_CHUNK);
+        int nbytes = chsend(iface->outbound_fd, pdu, sizeof(MIMPI_PDU));
+    ASSERT_SYS_OK(nbytes);
+    assert(nbytes == sizeof(*pdu));
+    return MIMPI_SUCCESS;
 }
 
 /// PDU has to be at least MAX_PDU_DATA_LENGTH wide.
-static void recv_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
-    ASSERT_SYS_OK(chrecv(iface->inbound_fd, pdu, MAX_PDU_DATA_LENGTH));
-}
+//static MIMPI_Retcode recv_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
+//    while (count > 0) {
+//        int nbytes = chrecv(iface->inbound_fd, pdu, sizeof(MIMPI_PDU));
+//        ASSERT_SYS_OK(nbytes);
+//        assert(nbytes == MAX_PDU_DATA_LENGTH);
+//
+//    }
+//
+//}
 
 // ----- API
 
 void MIMPI_Init(bool enable_deadlock_detection) {
+    LOG("Initialising process with rank %s\n", getenv(MIMPI_ENV_RANK));
     channels_init();
 
     make_instance(enable_deadlock_detection);
@@ -132,22 +144,49 @@ int MIMPI_World_rank() {
     return instance->rank;
 }
 
-MIMPI_Retcode MIMPI_Send(
-    void const *data,
-    int count,
-    int destination,
-    int tag
-) {
-    TODO
+MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) {
+    pdu_seq_t seq = 0;
+    int offset = 0;
+    MIMPI_Retcode status = MIMPI_SUCCESS;
+
+    while (offset < count) {
+        int chunk_size = min(offset + MAX_PDU_DATA_LENGTH, count);
+        MIMPI_PDU pdu = {
+                instance->rank,
+                tag,
+                seq,
+                chunk_size,
+                {0}
+        };
+
+        memcpy(pdu.data, (char const*) data + offset, chunk_size);
+
+        status = send_if(&instance->ifaces[destination], &pdu);
+        if (status != MIMPI_SUCCESS) {
+            break;
+        }
+
+        offset += MAX_PDU_DATA_LENGTH;
+        seq++;
+    }
+
+    return status;
 }
 
-MIMPI_Retcode MIMPI_Recv(
-    void *data,
-    int count,
-    int source,
-    int tag
-) {
-    TODO
+MIMPI_Retcode MIMPI_Recv(void *data, int count, int source, int tag) {
+
+    for (int i = 0; i < count; i += MAX_PDU_DATA_LENGTH) {
+        MIMPI_PDU pdu;
+        int nbytes = chrecv(instance->ifaces[source].inbound_fd, &pdu, sizeof(MIMPI_PDU));
+        ASSERT_SYS_OK(nbytes);
+        assert(nbytes == sizeof(MIMPI_PDU));
+        assert(pdu.src == source);
+        assert(pdu.tag == tag);
+
+        memcpy((char*) data + i, pdu.data, pdu.length);
+    }
+
+    return MIMPI_SUCCESS;
 }
 
 MIMPI_Retcode MIMPI_Barrier() {

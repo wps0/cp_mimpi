@@ -196,39 +196,72 @@ static MIMPI_Retcode validate_sendrecv_args() {
 }
 
 // ----- group functions
+#define PARENT(v, root) ((v - root) / 2 + root)
+#define LEFT(v, root) (2*(v) - root)
+#define RIGHT(v, root) (2*(v+1) - root)
+
 static MIMPI_Retcode internal_barrier(rank_t root) {
     LOG("%d is entering the barrier...\n", instance->rank);
+    // GDY ROOT != 0 to dzieci to:
+    // 2*(v - root) + root = 2*v - root
+    // 2*(v+1 - root) + root = 2*(v+1) - root
+    // ^ CHYBA ^
+    // parent: (v - root) / 2 + root
 
+    MIMPI_Retcode status = MIMPI_SUCCESS;
+    rank_t v = instance->rank;
     if (instance->rank == root) {
         for (int i = 0; i < instance->world_size; ++i) {
-            if (i != root) {
-                LOG("The root of the barrier (%d) is waiting for %d to enter.\n", root, i);
-                // TODO: w tym momencie jakiś proces może wywołać MIMPI_finalize => MIMPI_Recv da mu błąd, bo on będzie miał rank >= i
-                MIMPI_Recv(NULL, 0, i, _TAG_BARRIER_ENTERED);
-                LOG("The root of the barrier (%d) acknowledged that %d entered the barrier.\n", root, i);
-            }
+            if (i == root)
+                continue;
+            LOG("The root of the barrier (%d) is waiting for %d to enter.\n", root, i);
+            MIMPI_Retcode ret = MIMPI_Recv(NULL, 0, i, _TAG_BARRIER_ENTERED);
+            if (ret != MIMPI_SUCCESS)
+                status = ret;
+            LOG("The root of the barrier (%d) acknowledged that %d has entered the barrier or is offline.\n", root, i);
         }
     } else {
-        MIMPI_Send(NULL, 0, root, _TAG_BARRIER_ENTERED);
-        MIMPI_Recv(NULL, 0, root, _TAG_BARRIER_LEAVE);
+        MIMPI_Retcode ret = MIMPI_Recv(&status, sizeof(MIMPI_Retcode), PARENT(v, root), _TAG_BARRIER_LEAVE);
+        if (ret != MIMPI_SUCCESS)
+            status = ret;
     }
 
-    if (instance->rank < BARRIER_CONCURRENCY_FACTOR) {
-        for (int i = instance->rank + BARRIER_CONCURRENCY_FACTOR; i < instance->world_size; i += BARRIER_CONCURRENCY_FACTOR) {
-            if (i != root) {
-                MIMPI_Send(NULL, 0, i, _TAG_BARRIER_LEAVE);
-            }
-        }
-        MIMPI_Send(NULL, 0, instance->rank+1, _TAG_BARRIER_LEAVE);
-    }
+    if (LEFT(v, root) < instance->world_size)
+        MIMPI_Send(&status, sizeof(MIMPI_Retcode), LEFT(v, root), _TAG_BARRIER_LEAVE);
+    if (RIGHT(v, root) < instance->world_size)
+        MIMPI_Send(&status, sizeof(MIMPI_Retcode), RIGHT(v, root), _TAG_BARRIER_LEAVE);
 
-    LOG("%d is leaving the barrier...\n", instance->rank);
-    return MIMPI_SUCCESS;
+//    if (instance->rank == root) {
+//        for (int i = 0; i < instance->world_size; ++i) {
+//            if (i != root) {
+//                LOG("The root of the barrier (%d) is waiting for %d to enter.\n", root, i);
+//                // TODO: w tym momencie jakiś proces może wywołać MIMPI_finalize => MIMPI_Recv da mu błąd, bo on będzie miał rank >= i
+//                MIMPI_Recv(NULL, 0, i, _TAG_BARRIER_ENTERED);
+//                LOG("The root of the barrier (%d) acknowledged that %d entered the barrier.\n", root, i);
+//            }
+//        }
+//    } else {
+//        MIMPI_Send(NULL, 0, root, _TAG_BARRIER_ENTERED);
+//        MIMPI_Recv(NULL, 0, root, _TAG_BARRIER_LEAVE);
+//    }
+//
+//    if (instance->rank < BARRIER_CONCURRENCY_FACTOR) {
+//        for (int i = instance->rank + BARRIER_CONCURRENCY_FACTOR; i < instance->world_size; i += BARRIER_CONCURRENCY_FACTOR) {
+//            if (i != root) {
+//                MIMPI_Send(NULL, 0, i, _TAG_BARRIER_LEAVE);
+//            }
+//        }
+//        MIMPI_Send(NULL, 0, instance->rank+1, _TAG_BARRIER_LEAVE);
+//    }
+
+    LOG("%d is leaving the barrier with status %d...\n", instance->rank, status);
+    return status;
 }
 
 // ----- instance & interfaces management
 
 void free_iface(MIMPI_If *iface) {
+    iface->next_mid = 0;
     close(iface->outbound_fd);
     close(iface->inbound_fd);
 }
@@ -241,6 +274,10 @@ void init_ifaces(MIMPI_If *ifaces) {
             ifaces[i].outbound_fd = OUTBOUND_IF_FD(i);
         }
     }
+}
+
+static inline bool is_closed(MIMPI_If *iface) {
+    return iface->next_mid == 0;
 }
 
 void make_instance(bool enable_deadlock_detection) {
@@ -363,11 +400,7 @@ MIMPI_Retcode MIMPI_Barrier(void) {
     if (instance->world_size == 1)
         return MIMPI_SUCCESS;
 
-    MIMPI_PDU pdu;
-    MIMPI_Send(NULL, 0, (instance->rank + 1) % instance->world_size, _TAG_BARRIER_ENTERED);
-    MIMPI_Recv(&pdu, 0, (instance->rank - 1 + instance->world_size) % instance->world_size, _TAG_BARRIER_ENTERED);
-
-    TODO
+    internal_barrier(0);
 }
 
 MIMPI_Retcode MIMPI_Bcast(

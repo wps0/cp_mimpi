@@ -209,17 +209,17 @@ static MIMPI_Retcode MIMPI_Small_Recv(MIMPI_PDU *pdu, int source, int tag) {
 }
 
 // ----- group functions
-#define PARENT(v, root) ((v - root) / 2 + root)
-#define LEFT(v, root) (2*(v) - root)
-#define RIGHT(v, root) (2*(v) + 1 - root)
+#define PARENT(v, root) ((v) / 2)
+#define LEFT(v, root) (2*(v))
+#define RIGHT(v, root) (2*(v) + 1)
 
-static void down_propagate_barrier_data(rank_t child_rank, MIMPI_Retcode *status, void *data, int count) {
+static void propagate_barrier_data(rank_t child_rank, MIMPI_Retcode *status, void *data, int count) {
     LOG("%d is sending a barrier leave notification to %d\n", instance->rank, child_rank);
-    MIMPI_Send(status, sizeof(MIMPI_Retcode), child_rank, _TAG_BARRIER_LEAVE);
+    assert(MIMPI_Send(status, sizeof(MIMPI_Retcode), child_rank, _TAG_BARRIER_LEAVE) == MIMPI_SUCCESS);
 
-    if (data != NULL && status == MIMPI_SUCCESS) {
+    if (data != NULL && *status == MIMPI_SUCCESS) {
         LOG("%d is sending barrier data (%d byes) to %d\n", instance->rank, count, child_rank);
-        assert(MIMPI_Send(data, count, child_rank, _TAG_BARRIER_DATA));
+        assert(MIMPI_Send(data, count, child_rank, _TAG_BARRIER_DATA) == MIMPI_SUCCESS);
     }
 }
 
@@ -233,6 +233,8 @@ static MIMPI_Retcode internal_barrier(rank_t root, void *data, int count) {
 
     MIMPI_Retcode status = MIMPI_SUCCESS;
     rank_t v = instance->rank + 1;
+    int parent = PARENT(v, root) - 1;
+
     if (instance->rank == root) {
         for (int i = 0; i < instance->world_size; ++i) {
             if (i == root)
@@ -243,25 +245,30 @@ static MIMPI_Retcode internal_barrier(rank_t root, void *data, int count) {
                 status = ret;
             LOG("The root of the barrier (%d) acknowledged that %d has entered the barrier or is offline (ret: %d).\n", root, i, ret);
         }
+
+        if (root != 0)
+            propagate_barrier_data(0, &status, data, count);
     } else {
         MIMPI_Send(NULL, 0, root, _TAG_BARRIER_ENTER);
 
-        int parent = PARENT(v, root) - 1;
-        MIMPI_Retcode ret = MIMPI_Recv(&status, sizeof(MIMPI_Retcode), parent, _TAG_BARRIER_LEAVE);
+        int vparent = instance->rank == 0 ? root : parent;
+        MIMPI_Retcode ret = MIMPI_Recv(&status, sizeof(MIMPI_Retcode), vparent, _TAG_BARRIER_LEAVE);
+        LOG("%d has received the barrier leave notification.\n", instance->rank);
         if (ret != MIMPI_SUCCESS)
             status = ret;
 
         if (data != NULL) {
-            assert(MIMPI_Recv(data, count, parent, _TAG_BARRIER_DATA) == MIMPI_SUCCESS);
+            LOG("%d is waiting for data from %d.\n", instance->rank, vparent);
+            assert(MIMPI_Recv(data, count, vparent, _TAG_BARRIER_DATA) == MIMPI_SUCCESS);
         }
     }
 
-//    LOG("left(%d) = %d, right = %d", v, LEFT(v, root), RIGHT(v, root));
-    rank_t lchild = LEFT(v, root) - 1, rchild = RIGHT(v, root) - 1;
-    if (lchild < instance->world_size)
-        down_propagate_barrier_data(lchild, &status, data, count);
-    if (rchild < instance->world_size)
-        down_propagate_barrier_data(rchild, &status, data, count);
+    int lchild = LEFT(v, root) - 1, rchild = RIGHT(v, root) - 1;
+//    LOG("LEFT(%d) = %d, RIGHT = %d", v, lchild, rchild);
+    if (lchild != root && lchild < instance->world_size)
+        propagate_barrier_data(lchild, &status, data, count);
+    if (rchild != root && rchild < instance->world_size)
+        propagate_barrier_data(rchild, &status, data, count);
 
     LOG("%d is leaving the barrier with status %d...\n", instance->rank, status);
     return status;

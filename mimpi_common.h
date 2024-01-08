@@ -67,7 +67,8 @@ _Noreturn extern void fatal(const char* fmt, ...);
             );                                                                           \
     }
 
-#define LOG(fmt, ...) log_info(fmt, getpid(), __func__, __FILE__, __LINE__, __VA_ARGS__)
+//#define LOG(fmt, ...) log_info(fmt, getpid(), __func__, __FILE__, __LINE__, __VA_ARGS__)
+#define LOG(fmt, ...) asm("nop")
 #define INBOUND_IF_FD(rank) (INTERFACES_FD_OFFSET + (rank) * 2 + 1)
 #define OUTBOUND_IF_FD(rank) (INTERFACES_FD_OFFSET + (rank) * 2)
 

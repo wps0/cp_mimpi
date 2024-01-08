@@ -61,6 +61,8 @@ void log_info(const char* fmt, ...) {
     va_end(fmt_args);
 
     free(fmt_buf);
+
+    fflush(stderr);
 }
 
 #define MAX_PATH_LENGTH 1024

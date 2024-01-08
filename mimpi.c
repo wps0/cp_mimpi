@@ -17,8 +17,12 @@
 #define PDU_SIZE_WITHOUT_DATA_LENGTH (sizeof(*pdu) - MAX_PDU_DATA_LENGTH)
 #define EMPTY_MESSAGE_ID 0
 
+/// Specifies how many programs wake other
+#define BARRIER_CONCURRENCY_FACTOR 4
+
 #define _TAG_FIN -1
-#define _TAG_ENTERED_BARRIER -2
+#define _TAG_BARRIER_ENTERED -2
+#define _TAG_BARRIER_LEAVE -3
 
 
 // ----- structures
@@ -191,6 +195,36 @@ static MIMPI_Retcode validate_sendrecv_args() {
     return MIMPI_SUCCESS;
 }
 
+// ----- group functions
+static MIMPI_Retcode internal_barrier(rank_t root) {
+    LOG("%d is entering the barrier...\n", instance->rank);
+
+    if (instance->rank == root) {
+        for (int i = 0; i < instance->world_size; ++i) {
+            if (i != root) {
+                LOG("The root of the barrier (%d) is waiting for %d to enter.\n", root, i);
+                // TODO: w tym momencie jakiś proces może wywołać MIMPI_finalize => MIMPI_Recv da mu błąd, bo on będzie miał rank >= i
+                MIMPI_Recv(NULL, 0, i, _TAG_BARRIER_ENTERED);
+                LOG("The root of the barrier (%d) acknowledged that %d entered the barrier.\n", root, i);
+            }
+        }
+    } else {
+        MIMPI_Send(NULL, 0, root, _TAG_BARRIER_ENTERED);
+        MIMPI_Recv(NULL, 0, root, _TAG_BARRIER_LEAVE);
+    }
+
+    if (instance->rank < BARRIER_CONCURRENCY_FACTOR) {
+        for (int i = instance->rank + BARRIER_CONCURRENCY_FACTOR; i < instance->world_size; i += BARRIER_CONCURRENCY_FACTOR) {
+            if (i != root) {
+                MIMPI_Send(NULL, 0, i, _TAG_BARRIER_LEAVE);
+            }
+        }
+        MIMPI_Send(NULL, 0, instance->rank+1, _TAG_BARRIER_LEAVE);
+    }
+
+    LOG("%d is leaving the barrier...\n", instance->rank);
+    return MIMPI_SUCCESS;
+}
 
 // ----- instance & interfaces management
 
@@ -325,7 +359,14 @@ MIMPI_Retcode MIMPI_Recv(void *data, int count, int source, int tag) {
     return MIMPI_SUCCESS;
 }
 
-MIMPI_Retcode MIMPI_Barrier() {
+MIMPI_Retcode MIMPI_Barrier(void) {
+    if (instance->world_size == 1)
+        return MIMPI_SUCCESS;
+
+    MIMPI_PDU pdu;
+    MIMPI_Send(NULL, 0, (instance->rank + 1) % instance->world_size, _TAG_BARRIER_ENTERED);
+    MIMPI_Recv(&pdu, 0, (instance->rank - 1 + instance->world_size) % instance->world_size, _TAG_BARRIER_ENTERED);
+
     TODO
 }
 

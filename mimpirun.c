@@ -63,7 +63,7 @@ static void prepare_environment(int rank, int workers) {
         }
     }
 
-    // close the not relevant fds & free memory
+    // close the fds that are not relevant & free memory
     cleanup_channels(workers);
 }
 

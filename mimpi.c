@@ -346,12 +346,14 @@ int MIMPI_World_rank() {
 }
 
 MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) {
+    assert(data == NULL && count == 0 || count != 0 && data != NULL);
+
     pdu_seq_t seq = 0;
     int offset = 0;
     MIMPI_Retcode status = MIMPI_SUCCESS;
     MIMPI_If *iface = &instance->ifaces[destination];
 
-    while (offset < count) {
+    do {
         int chunk_size = min(MAX_PDU_DATA_LENGTH, count - offset);
         MIMPI_PDU pdu = {
                 instance->rank,
@@ -374,15 +376,16 @@ MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) 
 
         seq++;
         offset += chunk_size;
-    }
+    } while (offset < count);
 
     ++iface->next_mid;
     return status;
 }
 
 MIMPI_Retcode MIMPI_Recv(void *data, int count, int source, int tag) {
+    int offset = 0;
 
-    for (int i = 0; i < count; i += MAX_PDU_DATA_LENGTH) {
+    do {
         MIMPI_PDU pdu;
         int nbytes = chrecv(instance->ifaces[source].inbound_fd, &pdu, sizeof(MIMPI_PDU));
         ASSERT_SYS_OK(nbytes);
@@ -390,8 +393,9 @@ MIMPI_Retcode MIMPI_Recv(void *data, int count, int source, int tag) {
         assert(pdu.src == source);
         assert(pdu.tag == tag);
 
-        memcpy((char*) data + i, pdu.data, pdu.length);
-    }
+        memcpy((char*) data + offset, pdu.data, pdu.length);
+        offset += MAX_PDU_DATA_LENGTH;
+    } while (offset < count);
 
     return MIMPI_SUCCESS;
 }

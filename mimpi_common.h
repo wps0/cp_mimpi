@@ -67,6 +67,11 @@ _Noreturn extern void fatal(const char* fmt, ...);
             );                                                                           \
     }
 
+#define ASSERT_MIMPI_OK(expr) \
+    do {                          \
+        assert((expr) == MIMPI_SUCCESS);                          \
+    } while(0)
+
 #define LOG(fmt, ...) log_info(fmt, getpid(), __func__, __FILE__, __LINE__, __VA_ARGS__)
 //#define LOG(fmt, ...) asm("nop")
 #define INBOUND_IF_FD(rank) (INTERFACES_FD_OFFSET + (rank) * 2 + 1)
@@ -83,6 +88,7 @@ extern const char* MIMPI_ENV_WORLD_SIZE;
 void log_info(const char* fmt, ...);
 void print_open_descriptors(void);
 int min(int, int);
+int max(int, int);
 
 
 

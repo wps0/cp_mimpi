@@ -196,22 +196,32 @@ static MIMPI_Retcode validate_sendrecv_args() {
     return MIMPI_SUCCESS;
 }
 
-static MIMPI_Retcode MIMPI_Small_Recv(MIMPI_PDU *pdu, int source, int tag) {
-    int nbytes = chrecv(instance->ifaces[source].inbound_fd, pdu, sizeof(MIMPI_PDU));
-    ASSERT_SYS_OK(nbytes);
-    LOG("Read %d bytes\n", nbytes);
-    assert(nbytes == sizeof(MIMPI_PDU));
-    assert(pdu->src == source);
-    assert(pdu->tag == tag);
-    assert(pdu->total_length == pdu->length);
+// ----- group functions
+#define PARENT(v) ((v) / 2)
+#define LEFT(v) (2*(v))
+#define RIGHT(v) (2*(v) + 1)
 
-    return MIMPI_SUCCESS;
+inline static uint8_t apply_op(uint8_t a, uint8_t b, MIMPI_Op op) {
+    switch (op) {
+        case MIMPI_MAX:
+            return max(a, b);
+        case MIMPI_MIN:
+            return min(a, b);
+        case MIMPI_SUM:
+            return a + b;
+        case MIMPI_PROD:
+            return a * b;
+        default:
+            assert(false);
+    }
+    return 0;
 }
 
-// ----- group functions
-#define PARENT(v, root) ((v) / 2)
-#define LEFT(v, root) (2*(v))
-#define RIGHT(v, root) (2*(v) + 1)
+static void reduce(uint8_t *dest, uint8_t *source, MIMPI_Op op, int count) {
+    for (int i = 0; i < count; ++i) {
+        dest[i] = apply_op(dest[i], source[i], op);
+    }
+}
 
 static void propagate_barrier_data(rank_t child_rank, MIMPI_Retcode *status, void *data, int count) {
     LOG("%d is sending a barrier leave notification to %d\n", instance->rank, child_rank);
@@ -225,15 +235,10 @@ static void propagate_barrier_data(rank_t child_rank, MIMPI_Retcode *status, voi
 
 static MIMPI_Retcode internal_barrier(rank_t root, void *data, int count) {
     LOG("%d is entering the barrier...\n", instance->rank);
-    // GDY ROOT != 0 to dzieci to:
-    // 2*(v - root) + root = 2*v - root
-    // 2*(v+1 - root) + root = 2*(v+1) - root
-    // ^ CHYBA ^
-    // parent: (v - root) / 2 + root
 
     MIMPI_Retcode status = MIMPI_SUCCESS;
     rank_t v = instance->rank + 1;
-    int parent = PARENT(v, root) - 1;
+    int parent = PARENT(v) - 1;
 
     if (instance->rank == root) {
         for (int i = 0; i < instance->world_size; ++i) {
@@ -263,7 +268,8 @@ static MIMPI_Retcode internal_barrier(rank_t root, void *data, int count) {
         }
     }
 
-    int lchild = LEFT(v, root) - 1, rchild = RIGHT(v, root) - 1;
+    // propagate the messages down the tree
+    int lchild = LEFT(v) - 1, rchild = RIGHT(v) - 1;
 //    LOG("LEFT(%d) = %d, RIGHT = %d", v, lchild, rchild);
     if (lchild != root && lchild < instance->world_size)
         propagate_barrier_data(lchild, &status, data, count);
@@ -273,6 +279,94 @@ static MIMPI_Retcode internal_barrier(rank_t root, void *data, int count) {
     LOG("%d is leaving the barrier with status %d...\n", instance->rank, status);
     return status;
 }
+
+static MIMPI_Retcode internal_reduce(    void const *send_data,
+                                         void *recv_data,
+                                         int count,
+                                         MIMPI_Op op,
+                                         int root_dest
+) {
+    const int root = 0;
+    LOG("%d is entering the barrier...\n", instance->rank);
+
+    MIMPI_Retcode status = MIMPI_SUCCESS;
+    rank_t v = instance->rank + 1;
+    int parent = PARENT(v) - 1;
+
+    if (instance->rank == root) {
+        for (int i = 0; i < instance->world_size; ++i) {
+            if (i == root)
+                continue;
+            LOG("The root of the barrier (%d) is waiting for %d to enter.\n", root, i);
+            MIMPI_Retcode ret = MIMPI_Recv(NULL, 0, i, _TAG_BARRIER_ENTER);
+            if (ret != MIMPI_SUCCESS)
+                status = ret;
+            LOG("The root of the barrier (%d) acknowledged that %d has entered the barrier or is offline (ret: %d).\n", root, i, ret);
+        }
+
+        if (status != MIMPI_SUCCESS) {
+            LOG("Invalid status to proceed (%d)\n", status);
+            for (int i = 0; i < instance->world_size; ++i) {
+                if (i == root)
+                    continue;
+                MIMPI_Send(&status, sizeof(MIMPI_Retcode), i, _TAG_BARRIER_LEAVE);
+            }
+            return status;
+        }
+
+        for (int i = 0; i < instance->world_size; ++i) {
+            if (i == root)
+                continue;
+            if (LEFT(i) >= instance->world_size && RIGHT(i) >= instance->world_size)
+                ASSERT_MIMPI_OK(MIMPI_Send(&status, sizeof(MIMPI_Retcode), i, _TAG_BARRIER_LEAVE));
+        }
+
+        ASSERT_MIMPI_OK(MIMPI_Recv(recv_data, count, 0, _TAG_BARRIER_DATA));
+
+    } else {
+        MIMPI_Send(NULL, 0, root, _TAG_BARRIER_ENTER);
+
+        int vparent = instance->rank == 0 ? root : parent;
+        MIMPI_Retcode ret = MIMPI_Recv(&status, sizeof(MIMPI_Retcode), vparent, _TAG_BARRIER_LEAVE);
+        LOG("%d has received the barrier leave notification.\n", instance->rank);
+        if (ret != MIMPI_SUCCESS)
+            status = ret;
+
+        if (status != MIMPI_SUCCESS) {
+            LOG("Invalid status to proceed (%d)\n", status);
+            return status;
+        }
+
+        int dest = root_dest;
+        if (instance->rank != 0) {
+            dest = PARENT(v) - 1;
+            ASSERT_MIMPI_OK(MIMPI_Send(NULL, 0, dest, _TAG_BARRIER_LEAVE));
+        }
+
+        int lchild = LEFT(v) - 1, rchild = RIGHT(v) - 1;
+        if (status == MIMPI_SUCCESS) {
+            uint8_t *data = safe_calloc(count, sizeof(uint8_t));
+            uint8_t *buf = safe_calloc(count, sizeof(uint8_t));
+            memcpy(data, send_data, count);
+            if (lchild < instance->world_size) {
+                ASSERT_MIMPI_OK(MIMPI_Recv(buf, count, lchild, _TAG_BARRIER_DATA));
+                reduce(data, buf, op, count);
+            }
+            if (rchild < instance->world_size) {
+                ASSERT_MIMPI_OK(MIMPI_Recv(buf, count, rchild, _TAG_BARRIER_DATA));
+                reduce(data, buf, op, count);
+            }
+
+            ASSERT_MIMPI_OK(MIMPI_Send(data, count, dest, _TAG_BARRIER_DATA));
+            free(data);
+            free(buf);
+        }
+    }
+
+    LOG("%d is leaving the barrier with status %d...\n", instance->rank, status);
+    return status;
+}
+
 
 // ----- instance & interfaces management
 

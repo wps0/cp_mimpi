@@ -24,6 +24,7 @@
 #define _TAG_BARRIER_LEAVE -3
 #define _TAG_BARRIER_DATA -4
 #define _TAG_CURRENT_TRANSFER_FAILED -5
+#define _TAG_EMPTY_MESSAGE -32
 
 #define _TAG_RANGE_BARRIER -100
 
@@ -97,6 +98,29 @@ inline static void *safe_calloc(size_t nmemb, size_t size) {
 }
 
 // ----- Network stack
+
+// --- Interface management
+void free_iface(MIMPI_If *iface) {
+    close(iface->outbound_fd);
+    close(iface->inbound_fd);
+    iface->next_mid = 0;
+    iface->inbound_fd = -1;
+    iface->outbound_fd = -1;
+}
+
+void init_ifaces(MIMPI_If *ifaces) {
+    for (int i = 0; i < instance->world_size; i++) {
+        if (i != instance->rank) {
+            ifaces[i].next_mid = 1;
+            ifaces[i].inbound_fd = INBOUND_IF_FD(i);
+            ifaces[i].outbound_fd = OUTBOUND_IF_FD(i);
+        }
+    }
+}
+
+static inline bool iface_is_open(MIMPI_If *iface) {
+    return iface->next_mid > 0;
+}
 // --- Buffer
 static void buffer_init(MIMPI_Msg_Buffer *buf) {
     buf->last_pos = 0;
@@ -211,6 +235,9 @@ inline static void buffer_del(MIMPI_Msg *msg) {
     msg->id = EMPTY_MESSAGE_ID;
     free(msg->data);
     msg->data = NULL;
+    msg->received_size = 0;
+    msg->src = MAX_RANK + 1;
+    msg->tag = _TAG_EMPTY_MESSAGE;
 }
 
 static void buffer_clear(MIMPI_Msg_Buffer *buf, rank_t source) {
@@ -235,6 +262,11 @@ static void buffer_clear(MIMPI_Msg_Buffer *buf, rank_t source) {
 
 static MIMPI_Retcode send_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
     int nbytes = chsend(iface->outbound_fd, pdu, sizeof(MIMPI_PDU));
+//    printf("%d sending from %d tag %d\n", nbytes, pdu->src, pdu->tag);
+    if (nbytes == -1 && errno == EBADF) {
+        free_iface(iface);
+        return MIMPI_ERROR_REMOTE_FINISHED;
+    }
     ASSERT_SYS_OK(nbytes);
     assert(nbytes == sizeof(*pdu));
     return MIMPI_SUCCESS;
@@ -430,29 +462,7 @@ static MIMPI_Retcode internal_reduce(    void const *send_data,
 }
 
 
-// ----- instance & interfaces management
-
-void free_iface(MIMPI_If *iface) {
-    close(iface->outbound_fd);
-    close(iface->inbound_fd);
-    iface->next_mid = 0;
-    iface->inbound_fd = -1;
-    iface->outbound_fd = -1;
-}
-
-void init_ifaces(MIMPI_If *ifaces) {
-    for (int i = 0; i < instance->world_size; i++) {
-        if (i != instance->rank) {
-            ifaces[i].next_mid = 1;
-            ifaces[i].inbound_fd = INBOUND_IF_FD(i);
-            ifaces[i].outbound_fd = OUTBOUND_IF_FD(i);
-        }
-    }
-}
-
-static inline bool iface_is_open(MIMPI_If *iface) {
-    return iface->next_mid > 0;
-}
+// ----- instance management
 
 void make_instance(bool enable_deadlock_detection) {
     instance = safe_calloc(1, sizeof(MIMPI_Instance));
@@ -508,6 +518,7 @@ void MIMPI_Finalize() {
     free_instance(&instance);
 
     channels_finalize();
+    LOG("Process %d has finished.", instance->rank);
 }
 
 int MIMPI_World_size() {
@@ -623,7 +634,27 @@ MIMPI_Retcode MIMPI_Barrier(void) {
     if (instance->world_size == 1)
         return MIMPI_SUCCESS;
 
-    return internal_barrier(0, NULL, 0);
+    MIMPI_Retcode status = MIMPI_SUCCESS;
+    if (instance->rank == 0) {
+        for (int i = 1; i < instance->world_size; ++i) {
+            MIMPI_Retcode ret = MIMPI_Recv(NULL, 0, i, _TAG_BARRIER_ENTER);
+            if (ret != MIMPI_SUCCESS) {
+                status = ret;
+            }
+        }
+
+        for (int i = 1; i < instance->world_size; ++i) {
+            MIMPI_Send(&status, sizeof(MIMPI_Retcode), i, _TAG_BARRIER_LEAVE);
+        }
+    } else {
+        status = MIMPI_Send(NULL, 0, 0, _TAG_BARRIER_ENTER);
+        MIMPI_Retcode ret = MIMPI_Recv(&status, sizeof(MIMPI_Retcode), 0, _TAG_BARRIER_LEAVE);
+        if (ret != MIMPI_SUCCESS) {
+            status = ret;
+        }
+    }
+
+    return status;
 }
 
 MIMPI_Retcode MIMPI_Bcast(

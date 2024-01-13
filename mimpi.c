@@ -191,6 +191,7 @@ static MIMPI_Msg *buffer_find_oldest_msg_by_tag(MIMPI_Msg_Buffer *buf, rank_t sr
     MIMPI_Msg *found = NULL;
     do {
         MIMPI_Msg *entry = &buf->data[*i];
+        // TODO: to znajduje też puste msg, zaraz po callocu
         if ((entry->tag == tag || tag == 0) && entry->src == src && entry->received_size == entry->size)
             if (found == NULL || found->id > entry->id)
                 found = entry;
@@ -525,10 +526,11 @@ void MIMPI_Init(bool enable_deadlock_detection) {
 }
 
 void MIMPI_Finalize() {
+    int rank = instance->rank;
     free_instance(&instance);
 
     channels_finalize();
-    LOG("Process %d has finished.", instance->rank);
+    LOG("Process %d has finished.", rank);
 }
 
 int MIMPI_World_size() {
@@ -624,7 +626,7 @@ MIMPI_Retcode MIMPI_Recv(void *data, int count, int source, int tag) {
                 assert(pdu.src == i);
                 buffer_put(buf, &pdu);
                 MIMPI_Msg *tmp_msg = buffer_find_oldest_msg_by_tag(buf, source, tag);
-                if (i == source && pdu.tag == tag && is_msg_ready(tmp_msg)) {
+                if (i == source && pdu.tag == tag && is_msg_ready(tmp_msg) && count == tmp_msg->size) {
                     msg = tmp_msg;
                     break;
                 }

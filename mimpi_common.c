@@ -104,6 +104,8 @@ void print_open_descriptors(void)
     }
 
     closedir(dr);
+    fflush(stderr);
+    fflush(stdout);
 }
 
 int min(int a, int b) {

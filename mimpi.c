@@ -28,6 +28,8 @@
 
 #define _TAG_RANGE_BARRIER -100
 
+#define FOR_IFACE(i) for (MIMPI_If *(i) = &instance->ifaces; (i) != instance->ifaces+instance->world_size; (i)++)
+
 
 // ----- structures
 typedef uint32_t pdu_seq_t;
@@ -121,6 +123,7 @@ void init_ifaces(MIMPI_If *ifaces) {
 static inline bool iface_is_open(MIMPI_If *iface) {
     return iface->next_mid > 0;
 }
+
 // --- Buffer
 static void buffer_init(MIMPI_Msg_Buffer *buf) {
     buf->last_pos = 0;
@@ -263,7 +266,8 @@ static void buffer_clear(MIMPI_Msg_Buffer *buf, rank_t source) {
 static MIMPI_Retcode send_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
     int nbytes = chsend(iface->outbound_fd, pdu, sizeof(MIMPI_PDU));
 //    printf("%d sending from %d tag %d\n", nbytes, pdu->src, pdu->tag);
-    if (nbytes == -1 && errno == EBADF) {
+    if (nbytes == -1) {
+        assert(errno == EBADF || errno == EPIPE);
         free_iface(iface);
         return MIMPI_ERROR_REMOTE_FINISHED;
     }
@@ -272,7 +276,13 @@ static MIMPI_Retcode send_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
     return MIMPI_SUCCESS;
 }
 
-static MIMPI_Retcode validate_sendrecv_args() {
+static MIMPI_Retcode validate_sendrecv_args(int rank) {
+    if (!iface_is_open(&instance->ifaces[rank]))
+        return MIMPI_ERROR_REMOTE_FINISHED;
+    if (rank < 0 || rank >= instance->world_size)
+        return MIMPI_ERROR_NO_SUCH_RANK;
+    if (rank == instance->rank)
+        return MIMPI_ERROR_ATTEMPTED_SELF_OP;
     return MIMPI_SUCCESS;
 }
 
@@ -366,7 +376,7 @@ static MIMPI_Retcode internal_barrier(rank_t root, void *data, int count) {
 }
 
 inline static bool rank_exists(rank_t r) {
-    return r < instance->world_size;
+    return r >= 0 && r < instance->world_size;
 }
 
 inline static bool is_ok(MIMPI_Retcode ret) {
@@ -522,19 +532,17 @@ void MIMPI_Finalize() {
 }
 
 int MIMPI_World_size() {
-    // TODO: mutex?
     return instance->world_size;
 }
 
 int MIMPI_World_rank() {
-    // TODO: mutex?
     return instance->rank;
 }
 
 MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) {
-    if (destination < 0 || destination >= instance->world_size)
-        return MIMPI_ERROR_NO_SUCH_RANK;
     assert(data == NULL && count == 0 || count != 0 && data != NULL);
+    if (validate_sendrecv_args(destination) != MIMPI_SUCCESS)
+        return validate_sendrecv_args(destination);
 
     pdu_seq_t seq = 0;
     int offset = 0;
@@ -566,15 +574,16 @@ MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) 
         offset += chunk_size;
     } while (offset < count);
 
-    ++iface->next_mid;
+    if (status == MIMPI_SUCCESS)
+        ++iface->next_mid;
+
     return status;
 }
 
 MIMPI_Retcode MIMPI_Recv(void *data, int count, int source, int tag) {
     assert(data == NULL && count == 0 || count != 0 && data != NULL);
-    if (!iface_is_open(&instance->ifaces[source])) {
-        return MIMPI_ERROR_REMOTE_FINISHED;
-    }
+    if (validate_sendrecv_args(source) != MIMPI_SUCCESS)
+        return validate_sendrecv_args(source);
 
     MIMPI_Msg_Buffer *buf = instance->inbound_buf;
     MIMPI_Msg *msg = buffer_find_oldest_msg_by_tag(buf, source, tag);

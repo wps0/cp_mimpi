@@ -76,6 +76,8 @@ typedef struct MIMPI_Instance {
     int barrier_count;
     int finished;
 
+//    pthread_mutex_t buffer_mutex;
+
     MIMPI_If *ifaces;
     MIMPI_Msg_Buffer *inbound_buf;
 } MIMPI_Instance;
@@ -96,13 +98,13 @@ inline static void *safe_calloc(size_t nmemb, size_t size) {
 
 // ----- Network stack
 // --- Buffer
-static void init_buffer(MIMPI_Msg_Buffer *buf) {
+static void buffer_init(MIMPI_Msg_Buffer *buf) {
     buf->last_pos = 0;
     buf->sz = 4;
     buf->data = safe_calloc(buf->sz, sizeof(MIMPI_Msg));
 }
 
-static void free_buffer(MIMPI_Msg_Buffer *buf) {
+static void buffer_free(MIMPI_Msg_Buffer *buf) {
     for (int i = 0; i < buf->sz; ++i)
         if (buf->data[i].id != 0)
             free(buf->data[i].data);
@@ -119,6 +121,14 @@ static void init_message_with_pdu(MIMPI_Msg *msg, MIMPI_PDU *pdu) {
     msg->data = safe_calloc(msg->size, sizeof(uint8_t));
 }
 
+inline static bool is_msg_ready(MIMPI_Msg *msg) {
+    return msg != NULL && msg->received_size == msg->size;
+}
+
+inline static bool buffer_is_pos_empty(MIMPI_Msg *msg) {
+    return msg->id == 0;
+}
+
 inline static void insert_pdu_into_message(MIMPI_Msg *msg, MIMPI_PDU *pdu) {
     memcpy(msg->data + pdu->seq * MAX_PDU_DATA_LENGTH, pdu->data, pdu->length);
     msg->received_size += pdu->length;
@@ -133,11 +143,35 @@ inline static void buffer_enlarge(MIMPI_Msg_Buffer *buf) {
     buf->data = mem;
 }
 
-static MIMPI_Msg *buffer_find_msg(MIMPI_Msg_Buffer *buf, rank_t src, mid_t id) {
-    for (size_t i = 0; i < buf->sz; i++)
-        if (buf->data[i].id == id && buf->data[id].src == src)
-            return &buf->data[i];
+static MIMPI_Msg *buffer_find_msg_by_id(MIMPI_Msg_Buffer *buf, rank_t src, mid_t id) {
+    size_t starting_pos = buf->last_pos;
+    size_t *i = &buf->last_pos;
+
+    do {
+        if (buf->data[*i].id == id && buf->data[*i].src == src)
+            return &buf->data[*i];
+
+        *i = (*i + 1) % buf->sz;
+    } while (*i != starting_pos);
+
     return NULL;
+}
+
+static MIMPI_Msg *buffer_find_oldest_msg_by_tag(MIMPI_Msg_Buffer *buf, rank_t src, tag_t tag) {
+    size_t starting_pos = buf->last_pos;
+    size_t *i = &buf->last_pos;
+
+    MIMPI_Msg *found = NULL;
+    do {
+        MIMPI_Msg *entry = &buf->data[*i];
+        if ((entry->tag == tag || tag == 0) && entry->src == src && entry->received_size == entry->size)
+            if (found == NULL || found->id > entry->id)
+                found = entry;
+
+        *i = (*i + 1) % buf->sz;
+    } while (*i != starting_pos);
+
+    return found;
 }
 
 static MIMPI_Msg *buffer_find_free(MIMPI_Msg_Buffer *buf) {
@@ -145,7 +179,7 @@ static MIMPI_Msg *buffer_find_free(MIMPI_Msg_Buffer *buf) {
     size_t *i = &buf->last_pos;
 
     do {
-        if (buf->data[*i].id == 0)
+        if (buffer_is_pos_empty(&buf->data[*i]))
             return &buf->data[*i];
 
         *i = (*i + 1) % buf->sz;
@@ -155,25 +189,36 @@ static MIMPI_Msg *buffer_find_free(MIMPI_Msg_Buffer *buf) {
 }
 
 static void buffer_put(MIMPI_Msg_Buffer *buf, MIMPI_PDU *pdu) {
-    MIMPI_Msg *msg = buffer_find_msg(buf, pdu->src, pdu->id);
+    MIMPI_Msg *msg = buffer_find_msg_by_id(buf, pdu->src, pdu->id);
+//    LOG("%p\n", msg);
     if (msg == NULL) {
         msg = buffer_find_free(buf);
+//        LOG("ff %p\n", msg);
         if (msg == NULL) {
             // The buffer has to be enlarged.
             buffer_enlarge(buf);
+            msg = buffer_find_free(buf);
         }
 
-        msg = buffer_find_free(buf);
         init_message_with_pdu(msg, pdu);
     }
 
     insert_pdu_into_message(msg, pdu);
+//    LOG("%d %d %d %d\n", msg->id, msg->src, msg->received_size, msg->size);
 }
 
 inline static void buffer_del(MIMPI_Msg *msg) {
     msg->id = EMPTY_MESSAGE_ID;
     free(msg->data);
     msg->data = NULL;
+}
+
+static void buffer_clear(MIMPI_Msg_Buffer *buf, rank_t source) {
+    for (int i = 0; i < buf->sz; ++i) {
+        MIMPI_Msg *msg = &buf->data[i];
+        if (!buffer_is_pos_empty(msg) && msg->src == source)
+            buffer_del(msg);
+    }
 }
 
 // --- Receiver
@@ -405,8 +450,8 @@ void init_ifaces(MIMPI_If *ifaces) {
     }
 }
 
-static inline bool is_closed(MIMPI_If *iface) {
-    return iface->next_mid == 0;
+static inline bool iface_is_open(MIMPI_If *iface) {
+    return iface->next_mid > 0;
 }
 
 void make_instance(bool enable_deadlock_detection) {
@@ -427,7 +472,7 @@ void make_instance(bool enable_deadlock_detection) {
 
     instance->ifaces = safe_calloc(instance->world_size, sizeof(MIMPI_If));
     instance->inbound_buf = safe_calloc(1, sizeof(MIMPI_Msg_Buffer));
-    init_buffer(instance->inbound_buf);
+    buffer_init(instance->inbound_buf);
 }
 
 void free_instance(MIMPI_Instance **mimpiInstance) {
@@ -440,7 +485,7 @@ void free_instance(MIMPI_Instance **mimpiInstance) {
         free(inst->ifaces);
     }
 
-    free_buffer((*mimpiInstance)->inbound_buf);
+    buffer_free((*mimpiInstance)->inbound_buf);
     free((*mimpiInstance)->inbound_buf);
     free(*mimpiInstance);
     *mimpiInstance = NULL;
@@ -516,30 +561,60 @@ MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) 
 
 MIMPI_Retcode MIMPI_Recv(void *data, int count, int source, int tag) {
     assert(data == NULL && count == 0 || count != 0 && data != NULL);
+    if (!iface_is_open(&instance->ifaces[source])) {
+        return MIMPI_ERROR_REMOTE_FINISHED;
+    }
 
-    int offset = 0;
-    do {
-        MIMPI_PDU pdu;
-        int nbytes = chrecv(instance->ifaces[source].inbound_fd, &pdu, sizeof(MIMPI_PDU));
-        ASSERT_SYS_OK(nbytes);
-        assert(nbytes == sizeof(MIMPI_PDU));
-        assert(pdu.src == source);
-
-        if (pdu.tag == _TAG_CURRENT_TRANSFER_FAILED) {
-            LOG("Transfer to %d, souce=%d tag=%d interrupted by %d\n", instance->rank, source, tag, pdu.src);
-            MIMPI_Retcode code;
-            memcpy(&code, pdu.data, sizeof(code));
-            return code;
+    MIMPI_Msg_Buffer *buf = instance->inbound_buf;
+    MIMPI_Msg *msg = buffer_find_oldest_msg_by_tag(buf, source, tag);
+    fd_set inbound_fds;
+    MIMPI_PDU pdu;
+    // Blocks until a message matching the filter appears.
+    while (msg == NULL) {
+        FD_ZERO(&inbound_fds);
+        int maxfd = 0;
+        for (int i = 0; i < instance->world_size; ++i) {
+            MIMPI_If *iface = &instance->ifaces[i];
+            if (iface_is_open(iface)) {
+                FD_SET(iface->inbound_fd, &inbound_fds);
+                maxfd = max(maxfd, iface->inbound_fd);
+            } else if (i == source) {
+                // Source interface has finished
+                buffer_clear(buf, source);
+                return MIMPI_ERROR_REMOTE_FINISHED;
+            }
         }
 
-        assert(pdu.tag == tag);
+        ASSERT_SYS_OK(select(maxfd + 1, &inbound_fds, NULL, NULL, NULL));
+        for (int i = 0; i < instance->world_size; ++i) {
+            MIMPI_If *iface = &instance->ifaces[i];
+            if (iface_is_open(iface) && FD_ISSET(iface->inbound_fd, &inbound_fds)) {
+//                LOG("Receiving data on %d\n", i);
+                int nbytes = chrecv(iface->inbound_fd, &pdu, sizeof(MIMPI_PDU));
 
-        if (data != NULL) {
-            memcpy((char*) data + offset, pdu.data, pdu.length);
-            assert((char*)data + offset <= (char*) data + count);
+                if (nbytes == 0) {
+                    // end-of-file - pipe closed
+                    LOG("%d received EOF on %d\n", instance->rank, i);
+                    free_iface(iface);
+                    continue;
+                }
+
+//                LOG("PDU src=%d tag=%d id=%d seq=%d len=%d total_len=%d\n", pdu.src, pdu.tag, pdu.id, pdu.seq, pdu.length, pdu.total_length);
+                assert(nbytes == sizeof(MIMPI_PDU));
+                assert(pdu.src == i);
+                buffer_put(buf, &pdu);
+                MIMPI_Msg *tmp_msg = buffer_find_oldest_msg_by_tag(buf, source, tag);
+                if (i == source && pdu.tag == tag && is_msg_ready(tmp_msg)) {
+                    msg = tmp_msg;
+                    break;
+                }
+            }
         }
-        offset += MAX_PDU_DATA_LENGTH;
-    } while (offset < count);
+    }
+
+    assert(msg->size == count);
+    memcpy(data, msg->data, msg->size);
+    buffer_del(msg);
 
     return MIMPI_SUCCESS;
 }

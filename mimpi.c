@@ -13,14 +13,10 @@
 #include "mimpi.h"
 #include "mimpi_common.h"
 
-#define MAX_PDU_DATA_LENGTH 256
-#define CHANNELS_MAX_ATOMIC_DATA_CHUNK 512
-#define PDU_SIZE_WITHOUT_DATA_LENGTH (sizeof(*pdu) - MAX_PDU_DATA_LENGTH)
+#define MAX_PDU_DATA_LENGTH 356
 #define EMPTY_MESSAGE_ID 0
 #define BUFFER_INITIAL_SIZE 4
 #define BUFFER_GROW_FACTOR 2
-#define FD_READER_RE 512
-#define FD_READER_WE 513
 
 /// Specifies how many programs wake other
 #define BARRIER_CONCURRENCY_FACTOR 4
@@ -361,6 +357,7 @@ static void *inbound_iface_handler(void *arg) {
                 pthread_mutex_unlock(&instance->mutex);
                 continue;
             }
+
             if (nbytes == -1) {
                 // The main thread has closed an fd from which
                 // this thread was reading.
@@ -403,7 +400,6 @@ static void *inbound_iface_handler(void *arg) {
 
 static MIMPI_Retcode send_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
     int nbytes = chsend(iface->outbound_fd, pdu, sizeof(MIMPI_PDU));
-//    printf("%d sending from %d tag %d\n", nbytes, pdu->src, pdu->tag);
     if (nbytes == -1) {
         assert(errno == EBADF || errno == EPIPE);
 
@@ -718,7 +714,7 @@ MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) 
 
     pthread_mutex_lock(&instance->mutex);
     MIMPI_If *iface = &instance->ifaces[destination];
-    mid_t next_mid = iface->next_mid;
+    mid_t next_mid = iface->next_mid++;
     pthread_mutex_unlock(&instance->mutex);
 
     do {
@@ -745,12 +741,6 @@ MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) 
         seq++;
         offset += chunk_size;
     } while (offset < count);
-
-    if (status == MIMPI_SUCCESS) {
-//        pthread_mutex_lock(&instance->buffer_mutex);
-        ++iface->next_mid;
-//        pthread_mutex_unlock(&instance->buffer_mutex);
-    }
 
     return status;
 }
@@ -827,7 +817,24 @@ MIMPI_Retcode MIMPI_Bcast(
     int count,
     int root
 ) {
-    return internal_barrier(root, data, count);
+    if (root < 0 || root >= instance->world_size)
+        return MIMPI_ERROR_NO_SUCH_RANK;
+    if (instance->world_size == 1)
+        return MIMPI_SUCCESS;
+
+    MIMPI_Retcode ret = MIMPI_Barrier();
+    if (ret != MIMPI_SUCCESS)
+        return ret;
+
+    if (instance->rank == root) {
+        for (int i = 0; i < instance->world_size; ++i)
+            if (i != root)
+                MIMPI_Send(data, count, i, _TAG_BARRIER_DATA);
+    } else {
+        MIMPI_Recv(data, count, root, _TAG_BARRIER_DATA);
+    }
+
+    return MIMPI_SUCCESS;
 }
 
 MIMPI_Retcode MIMPI_Reduce(
@@ -837,5 +844,27 @@ MIMPI_Retcode MIMPI_Reduce(
     MIMPI_Op op,
     int root
 ) {
-    return internal_reduce(send_data, recv_data, count, op, root);
+    if (root < 0 || root >= instance->world_size)
+        return MIMPI_ERROR_NO_SUCH_RANK;
+    if (instance->world_size == 1)
+        return MIMPI_SUCCESS;
+
+    MIMPI_Retcode ret = MIMPI_Barrier();
+    if (ret != MIMPI_SUCCESS)
+        return ret;
+
+    if (instance->rank == root) {
+        memcpy(recv_data, send_data, count);
+
+        uint8_t *buf = safe_calloc(count, sizeof(uint8_t));
+        for (int i = 0; i < instance->world_size; ++i)
+            if (i != root) {
+                MIMPI_Recv(buf, count, i, _TAG_BARRIER_DATA);
+                reduce(recv_data, buf, op, count);
+            }
+    } else {
+        MIMPI_Send(send_data, count, root, _TAG_BARRIER_DATA);
+    }
+
+    return MIMPI_SUCCESS;
 }

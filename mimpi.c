@@ -2,7 +2,7 @@
  * This file is for implementation of MIMPI library.
  * */
 
-#include <bits/stdint-uintn.h>
+#include <stdint.h>
 #include <malloc.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -13,7 +13,7 @@
 #include "mimpi.h"
 #include "mimpi_common.h"
 
-#define MAX_PDU_DATA_LENGTH 356
+#define MAX_PDU_DATA_LENGTH 384
 #define EMPTY_MESSAGE_ID 0
 #define BUFFER_INITIAL_SIZE 4
 #define BUFFER_GROW_FACTOR 2
@@ -56,7 +56,6 @@ typedef struct MIMPI_If {
     int inbound_fd, outbound_fd;
 } MIMPI_If;
 
-// TODO: włączyć sequence_Number w message id?
 typedef struct MIMPI_PDU {
     rank_t src;
     tag_t tag;
@@ -267,13 +266,6 @@ inline static void buffer_del(MIMPI_Msg *msg) {
     msg->tag = _TAG_EMPTY_MESSAGE;
 }
 
-//static void buffer_clear(MIMPI_Msg_Buffer *buf, rank_t source) {
-//    for (int i = 0; i < buf->sz; ++i) {
-//        MIMPI_Msg *msg = &buf->data[i];
-//        if (!is_msg_empty(msg) && msg->src == source)
-//            buffer_del(msg);
-//    }
-//}
 
 // --- Receiver
 
@@ -466,7 +458,7 @@ static MIMPI_Retcode internal_barrier() {
     LOG("%d is entering the barrier...\n", instance->rank);
 
     rank_t v = instance->rank + 1;
-    int lchild = LEFT(v) - 1, rchild = RIGHT(v) - 1, /*parent = (v == 16 ? 1 : PARENT(v)) - 1*/ parent = PARENT(v) - 1;
+    int lchild = LEFT(v) - 1, rchild = RIGHT(v) - 1, parent = PARENT(v) - 1;
 
     MIMPI_Retcode status, lst, rst, lchst, rchst;
     status = lst = rst = lchst = rchst = MIMPI_SUCCESS;
@@ -483,16 +475,10 @@ static MIMPI_Retcode internal_barrier() {
         if (pst != MIMPI_SUCCESS)
             status = pst;
         else {
-            //TODO
             MIMPI_Retcode ret = MIMPI_Recv(&pst, sizeof(MIMPI_Retcode), parent, _TAG_BARRIER_LEAVE);
             status = get_failing2(get_failing2(ret, pst), status);
-
-            printf("%d ABBA Z PARENTA %d?? %d\n", v-1, status, parent);
             fflush(stdout);
         }
-    } else {
-//        if (instance->worl)
-// TODO: 0 wysyla do 15
     }
 
     if (lchild < instance->world_size)
@@ -693,7 +679,8 @@ MIMPI_Retcode MIMPI_Recv(void *data, int count, int source, int tag) {
 
     if (status == MIMPI_SUCCESS) {
         assert(msg->src == source);
-        assert(msg->tag == tag);
+        if (tag != MIMPI_ANY_TAG)
+            assert(msg->tag == tag);
         assert(msg->size == count);
         // Even if count = 0, memcpy behaves correctly.
         memcpy(data, msg->data, count);
@@ -706,27 +693,6 @@ MIMPI_Retcode MIMPI_Recv(void *data, int count, int source, int tag) {
 MIMPI_Retcode MIMPI_Barrier(void) {
     if (instance->world_size == 1)
         return MIMPI_SUCCESS;
-//    LOG("%d has entered a barrier\n", instance->rank);
-//
-//    MIMPI_Retcode status = MIMPI_SUCCESS;
-//    if (instance->rank == 0) {
-//        for (int i = 1; i < instance->world_size; ++i) {
-//            MIMPI_Retcode ret = MIMPI_Recv(NULL, 0, i, _TAG_BARRIER_ENTER);
-//            if (ret != MIMPI_SUCCESS) {
-//                status = ret;
-//            }
-//        }
-//
-//        for (int i = 1; i < instance->world_size; ++i) {
-//            MIMPI_Send(&status, sizeof(MIMPI_Retcode), i, _TAG_BARRIER_LEAVE);
-//        }
-//    } else {
-//        status = MIMPI_Send(NULL, 0, 0, _TAG_BARRIER_ENTER);
-//        MIMPI_Retcode ret = MIMPI_Recv(&status, sizeof(MIMPI_Retcode), 0, _TAG_BARRIER_LEAVE);
-//        if (ret != MIMPI_SUCCESS) {
-//            status = ret;
-//        }
-//    }
 
     return internal_barrier();
 }

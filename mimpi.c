@@ -110,8 +110,8 @@ inline static void *safe_calloc(size_t nmemb, size_t size) {
 
 // --- Interface management
 void free_iface(MIMPI_If *iface) {
-    close(iface->outbound_fd);
-    close(iface->inbound_fd);
+    ASSERT_SYS_OK(close(iface->outbound_fd));
+    ASSERT_SYS_OK(close(iface->inbound_fd));
     iface->next_mid = 0;
     iface->inbound_fd = -1;
     iface->outbound_fd = -1;
@@ -128,7 +128,7 @@ void init_ifaces(MIMPI_If *ifaces) {
 }
 
 static inline bool iface_is_open(MIMPI_If *iface) {
-    return iface->next_mid > 0;
+    return iface->next_mid > 0 && iface->inbound_fd > 0 && iface->outbound_fd > 0;
 }
 
 // --- Buffer
@@ -321,7 +321,6 @@ static void *inbound_iface_handler(void *arg) {
 
         int st = select(maxfd + 1, &in_fds, NULL, NULL, NULL);
         if (st == -1) {
-            assert(instance->finished);
             continue;
         }
 
@@ -335,7 +334,8 @@ static void *inbound_iface_handler(void *arg) {
                 // end-of-file - pipe closed
                 LOG("%d received EOF on %d\n", instance->rank, i);
                 pthread_mutex_lock(&instance->mutex);
-                free_iface(iface);
+                if (iface_is_open(iface))
+                    free_iface(iface);
 
                 if (instance->pending_request && instance->req_src == i) {
                     reset_request();
@@ -608,8 +608,10 @@ MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) 
     MIMPI_Retcode status = MIMPI_SUCCESS;
 
     pthread_mutex_lock(&instance->mutex);
-    if (!iface_is_open(&instance->ifaces[destination]))
+    if (!iface_is_open(&instance->ifaces[destination])) {
+        pthread_mutex_unlock(&instance->mutex);
         return MIMPI_ERROR_REMOTE_FINISHED;
+    }
 
     MIMPI_If *iface = &instance->ifaces[destination];
     mid_t next_mid = iface->next_mid;

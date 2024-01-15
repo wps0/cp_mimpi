@@ -83,13 +83,15 @@ typedef struct MIMPI_Instance {
 
     volatile bool finished;
     pthread_mutex_t buffer_mutex;
-    pthread_cond_t msg_arrived,
-    int rf_sync_fd[2];
+    pthread_cond_t reader_event;
     // requested message parameters
     bool pending_request;
     rank_t req_src;
     tag_t req_tag;
-    size_t req_count;
+    int req_count;
+    MIMPI_Retcode req_status;
+    MIMPI_Msg *req_response;
+    pthread_t reader_thread;
 
     MIMPI_If *ifaces;
     MIMPI_Msg_Buffer *inbound_buf;
@@ -257,6 +259,9 @@ static MIMPI_Msg *buffer_put(MIMPI_Msg_Buffer *buf, MIMPI_PDU *pdu) {
 }
 
 inline static void buffer_del(MIMPI_Msg *msg) {
+    if (msg == NULL) {
+        return;
+    }
     msg->id = EMPTY_MESSAGE_ID;
     free(msg->data);
     msg->data = NULL;
@@ -275,6 +280,17 @@ static void buffer_clear(MIMPI_Msg_Buffer *buf, rank_t source) {
 
 // --- Receiver
 
+static void reset_request(void) {
+    instance->pending_request = false;
+    instance->req_count = 0;
+    instance->req_src = 0;
+    instance->req_tag = _TAG_EMPTY_MESSAGE;
+    instance->req_status = MIMPI_SUCCESS;
+    instance->req_response = NULL;
+}
+
+/// Captures data from inbound interfaces and puts it in
+/// the instance buffer.
 static void *inbound_iface_handler(void *arg) {
     MIMPI_Msg_Buffer *buffer = instance->inbound_buf;
     fd_set inbound_fds;
@@ -284,7 +300,7 @@ static void *inbound_iface_handler(void *arg) {
         FD_ZERO(&inbound_fds);
         int maxfd = 0;
 
-//        pthread_mutex_lock(&instance->buffer_mutex);
+        pthread_mutex_lock(&instance->buffer_mutex);
         for (int i = 0; i < instance->world_size; ++i) {
             MIMPI_If *iface = &instance->ifaces[i];
             if (iface_is_open(iface)) {
@@ -295,9 +311,19 @@ static void *inbound_iface_handler(void *arg) {
 
         if (instance->pending_request && !FD_ISSET(instance->req_src, &inbound_fds)) {
             // the peer is down
-            // TODO: notify the waiting reader
+            reset_request();
+            instance->req_response = buffer_find_oldest_msg_by_tag(instance->inbound_buf, instance->req_src,
+                                                                   instance->req_tag, instance->req_count);
+            if (instance->req_response == NULL)
+                instance->req_status = MIMPI_ERROR_REMOTE_FINISHED;
+            pthread_cond_signal(&instance->reader_event);
         }
-//        pthread_mutex_unlock(&instance->buffer_mutex);
+        pthread_mutex_unlock(&instance->buffer_mutex);
+
+        if (maxfd == 0) {
+            LOG("Reader: no interfaces open, exiting...\n", "");
+            break;
+        }
 
         ASSERT_SYS_OK(select(maxfd + 1, &inbound_fds, NULL, NULL, NULL));
         for (int i = 0; i < instance->world_size; ++i) {
@@ -313,19 +339,26 @@ static void *inbound_iface_handler(void *arg) {
                     continue;
                 }
 
-//                LOG("PDU src=%d tag=%d id=%d seq=%d len=%d total_len=%d\n", pdu.src, pdu.tag, pdu.id, pdu.seq, pdu.length, pdu.total_length);
+                LOG("PDU src=%d tag=%d id=%d seq=%d len=%d total_len=%d\n", pdu.src, pdu.tag, pdu.id, pdu.seq, pdu.length, pdu.total_length);
                 assert(nbytes == sizeof(MIMPI_PDU));
                 assert(pdu.src == i);
+
+                pthread_mutex_lock(&instance->buffer_mutex);
                 MIMPI_Msg *msg = buffer_put(buffer, &pdu);
 
                 if (instance->pending_request && i == instance->req_src
                     && pdu.tag == instance->req_tag && pdu.total_length == instance->req_count
                     && is_msg_ready(msg)) {
-                    // TODO
+                    instance->req_response = msg;
+
+                    pthread_cond_signal(&instance->reader_event);
                 }
+                pthread_mutex_unlock(&instance->buffer_mutex);
             }
         }
     }
+
+    return NULL;
 }
 
 // --- Generic code
@@ -351,8 +384,6 @@ static MIMPI_Retcode validate_sendrecv_args(int rank) {
         return MIMPI_ERROR_ATTEMPTED_SELF_OP;
     if (rank < 0 || rank >= instance->world_size)
         return MIMPI_ERROR_NO_SUCH_RANK;
-    if (!iface_is_open(&instance->ifaces[rank]))
-        return MIMPI_ERROR_REMOTE_FINISHED;
     return MIMPI_SUCCESS;
 }
 
@@ -548,10 +579,7 @@ void make_instance(bool enable_deadlock_detection) {
     instance = safe_calloc(1, sizeof(MIMPI_Instance));
     instance->deadlock_detection = enable_deadlock_detection;
     instance->barrier_count = 0;
-    instance->pending_request = false;
-    instance->req_count = 0;
-    instance->req_src = 0;
-    instance->req_tag = _TAG_EMPTY_MESSAGE;
+    reset_request();
 
     // rank & world_size
     char *env_ptr;
@@ -572,16 +600,17 @@ void make_instance(bool enable_deadlock_detection) {
 
     // mutexes
     ASSERT_ZERO(pthread_mutex_init(&instance->buffer_mutex, NULL));
+    ASSERT_ZERO(pthread_cond_init(&instance->reader_event, NULL));
 }
 
 void free_instance(MIMPI_Instance **mimpiInstance) {
     MIMPI_Instance *inst = *mimpiInstance;
     inst->finished = true;
 
-    int buf = 0;
-    chrecv(instance->rf_sync_fd[0], &buf, sizeof(buf));
-    assert(buf == 0xdead);
+    ASSERT_ZERO(pthread_join(instance->reader_thread, NULL));
+
     pthread_mutex_destroy(&inst->buffer_mutex);
+    pthread_cond_destroy(&inst->reader_event);
 
     // free interfaces
     if (inst->ifaces != NULL) {
@@ -607,6 +636,8 @@ void MIMPI_Init(bool enable_deadlock_detection) {
 
     make_instance(enable_deadlock_detection);
     init_ifaces(instance->ifaces);
+
+    ASSERT_ZERO(pthread_create(&instance->reader_thread, NULL, inbound_iface_handler, NULL));
 }
 
 void MIMPI_Finalize() {
@@ -629,6 +660,8 @@ MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) 
     assert(data == NULL && count == 0 || count != 0 && data != NULL);
     if (validate_sendrecv_args(destination) != MIMPI_SUCCESS)
         return validate_sendrecv_args(destination);
+    if (!iface_is_open(&instance->ifaces[destination]))
+        return MIMPI_ERROR_REMOTE_FINISHED;
 
     pdu_seq_t seq = 0;
     int offset = 0;
@@ -679,58 +712,33 @@ MIMPI_Retcode MIMPI_Recv(void *data, int count, int source, int tag) {
     if (validate_sendrecv_args(source) != MIMPI_SUCCESS)
         return validate_sendrecv_args(source);
 
-    MIMPI_Msg_Buffer *buf = instance->inbound_buf;
-    MIMPI_Msg *msg = buffer_find_oldest_msg_by_tag(buf, source, tag, count);
-    fd_set inbound_fds;
-    MIMPI_PDU pdu;
-    // Blocks until a message matching the filter appears.
-    while (msg == NULL) {
-        FD_ZERO(&inbound_fds);
-        int maxfd = 0;
-        for (int i = 0; i < instance->world_size; ++i) {
-            MIMPI_If *iface = &instance->ifaces[i];
-            if (iface_is_open(iface)) {
-                FD_SET(iface->inbound_fd, &inbound_fds);
-                maxfd = max(maxfd, iface->inbound_fd);
-            } else if (i == source) {
-                // Source interface has finished
-                buffer_clear(buf, source);
-                return MIMPI_ERROR_REMOTE_FINISHED;
-            }
-        }
+    pthread_mutex_lock(&instance->buffer_mutex);
+    MIMPI_Msg *msg = buffer_find_oldest_msg_by_tag(instance->inbound_buf, source, tag, count);
 
-        ASSERT_SYS_OK(select(maxfd + 1, &inbound_fds, NULL, NULL, NULL));
-        for (int i = 0; i < instance->world_size; ++i) {
-            MIMPI_If *iface = &instance->ifaces[i];
-            if (iface_is_open(iface) && FD_ISSET(iface->inbound_fd, &inbound_fds)) {
-//                LOG("Receiving data on %d\n", i);
-                int nbytes = chrecv(iface->inbound_fd, &pdu, sizeof(MIMPI_PDU));
+    LOG("MSG: %p\n", msg);
 
-                if (nbytes == 0) {
-                    // end-of-file - pipe closed
-                    LOG("%d received EOF on %d\n", instance->rank, i);
-                    free_iface(iface);
-                    continue;
-                }
-
-//                LOG("PDU src=%d tag=%d id=%d seq=%d len=%d total_len=%d\n", pdu.src, pdu.tag, pdu.id, pdu.seq, pdu.length, pdu.total_length);
-                assert(nbytes == sizeof(MIMPI_PDU));
-                assert(pdu.src == i);
-                buffer_put(buf, &pdu);
-                MIMPI_Msg *tmp_msg = buffer_find_oldest_msg_by_tag(buf, source, tag, count);
-                if (i == source && (pdu.tag == tag || tag == 0) && is_msg_ready(tmp_msg) && count == tmp_msg->size) {
-                    msg = tmp_msg;
-                    break;
-                }
-            }
-        }
+    if (msg == NULL) {
+        instance->req_src = source;
+        instance->req_tag = tag;
+        instance->req_count = count;
+        instance->pending_request = true;
+        pthread_cond_wait(&instance->reader_event, &instance->buffer_mutex);
+        instance->pending_request = false;
+        msg = instance->req_response;
     }
 
-    assert(msg->size == count);
-    memcpy(data, msg->data, msg->size);
-    buffer_del(msg);
+    pthread_mutex_unlock(&instance->buffer_mutex);
 
-    return MIMPI_SUCCESS;
+    if (instance->req_status == MIMPI_SUCCESS) {
+        if (count > 0)
+            memcpy(data, msg->data, count);
+
+        pthread_mutex_lock(&instance->buffer_mutex);
+        buffer_del(msg);
+        pthread_mutex_unlock(&instance->buffer_mutex);
+    }
+
+    return instance->req_status;
 }
 
 MIMPI_Retcode MIMPI_Barrier(void) {

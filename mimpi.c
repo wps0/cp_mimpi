@@ -18,16 +18,11 @@
 #define BUFFER_INITIAL_SIZE 4
 #define BUFFER_GROW_FACTOR 2
 
-/// Specifies how many programs wake other
-#define BARRIER_CONCURRENCY_FACTOR 4
-
 #define _TAG_BARRIER_ENTER -2
 #define _TAG_BARRIER_LEAVE -3
 #define _TAG_BARRIER_DATA -4
-#define _TAG_CURRENT_TRANSFER_FAILED -5
 #define _TAG_EMPTY_MESSAGE -32
 
-#define _TAG_RANGE_BARRIER -100
 
 #define FOR_IFACE(i) for (MIMPI_If *(i) = instance->ifaces; (i) != instance->ifaces+instance->world_size; ++(i))
 #define FOR_IFACE_IT(i, it) for (MIMPI_If *(i) = instance->ifaces; (i) != instance->ifaces+instance->world_size; ++(i), ++(it))
@@ -100,7 +95,6 @@ typedef struct MIMPI_Instance {
 
 // ----- program data
 static MIMPI_Instance *instance;
-static const MIMPI_Msg EMPTY_MESSAGE = {EMPTY_MESSAGE_ID, _TAG_EMPTY_MESSAGE, -1, 0, 0, NULL};
 
 // -----------------------
 // ----- helper functions
@@ -138,13 +132,9 @@ static inline bool iface_is_open(MIMPI_If *iface) {
 }
 
 // --- Buffer
-// TODO: to może nie wystarczyć
-inline static bool is_msg_empty(MIMPI_Msg *msg) {
-    return msg->id == EMPTY_MESSAGE.id && msg->tag == EMPTY_MESSAGE.tag;
-}
 
 inline static bool is_msg_ready(MIMPI_Msg *msg) {
-    return msg != NULL && !is_msg_empty(msg) && msg->received_size == msg->size;
+    return msg != NULL && msg->received_size == msg->size;
 }
 
 static void buffer_init(MIMPI_Msg_Buffer *buf) {
@@ -219,8 +209,8 @@ static MIMPI_Msg *buffer_find_oldest_msg_by_tag(MIMPI_Msg_Buffer *buf, rank_t sr
     MIMPI_Msg *found = NULL;
     do {
         MIMPI_Msg *entry = buf->data[*i];
-        if (entry != NULL && (entry->tag == tag || tag == 0) && entry->src == src
-            && entry->received_size == entry->size && entry->size == count)
+        if (is_msg_ready(entry) && (entry->tag == tag || tag == MIMPI_ANY_TAG) && entry->src == src
+            && entry->size == count)
             if (found == NULL || found->id > entry->id)
                 found = entry;
 
@@ -350,6 +340,7 @@ static void *inbound_iface_handler(void *arg) {
                 if (instance->pending_request && instance->req_src == i) {
                     reset_request();
                     instance->req_status = MIMPI_ERROR_REMOTE_FINISHED;
+                    instance->pending_request = false;
 
                     pthread_cond_signal(&instance->reader_event);
                 }
@@ -365,14 +356,14 @@ static void *inbound_iface_handler(void *arg) {
                 break;
             }
 
-//            LOG("PDU src=%d tag=%d id=%d seq=%d len=%d total_len=%d\n", pdu.src, pdu.tag, pdu.id, pdu.seq, pdu.length, pdu.total_length);
+            LOG("PDU src=%d tag=%d id=%d seq=%d len=%d total_len=%d\n", pdu.src, pdu.tag, pdu.id, pdu.seq, pdu.length, pdu.total_length);
             assert(nbytes == sizeof(MIMPI_PDU));
             assert(pdu.src == i);
 
             pthread_mutex_lock(&instance->mutex);
             MIMPI_Msg *msg = buffer_put(instance->inbound_buf, &pdu);
-//            LOG("requested:  src=%d tag=%d count=%d\n", instance->req_src, instance->req_tag, instance->req_count);
-            if (instance->pending_request && i == instance->req_src && (pdu.tag == instance->req_tag || instance->req_tag == MIMPI_ANY_TAG)
+//            LOG("requested: src=%d tag=%d count=%d\n", instance->req_src, instance->req_tag, instance->req_count);
+            if (instance->pending_request && pdu.src == instance->req_src && (pdu.tag == instance->req_tag || instance->req_tag == MIMPI_ANY_TAG)
                 && pdu.total_length == instance->req_count && is_msg_ready(msg)) {
 //                LOG("Packet matches!\n", "");
                 instance->req_response = msg;
@@ -402,6 +393,7 @@ static MIMPI_Retcode send_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
     int nbytes = chsend(iface->outbound_fd, pdu, sizeof(MIMPI_PDU));
     if (nbytes == -1) {
         assert(errno == EBADF || errno == EPIPE);
+        LOG("Error (errno: %d) while sending data to fd %d\n", errno, iface->outbound_fd);
 
         pthread_mutex_lock(&instance->mutex);
         if (iface_is_open(iface))
@@ -444,168 +436,73 @@ inline static uint8_t apply_op(uint8_t a, uint8_t b, MIMPI_Op op) {
     return 0;
 }
 
-inline static int barrier_tag(int barrier_count) {
-    return _TAG_RANGE_BARRIER - barrier_count;
-}
-
 static void reduce(uint8_t *dest, uint8_t *source, MIMPI_Op op, int count) {
     for (int i = 0; i < count; ++i) {
         dest[i] = apply_op(dest[i], source[i], op);
     }
 }
 
-static void propagate_barrier_data(rank_t child_rank, MIMPI_Retcode *status, void *data, int count) {
-    LOG("%d is sending a barrier leave notification to %d\n", instance->rank, child_rank);
-    assert(MIMPI_Send(status, sizeof(MIMPI_Retcode), child_rank, _TAG_BARRIER_LEAVE) == MIMPI_SUCCESS);
-
-    if (data != NULL && *status == MIMPI_SUCCESS) {
-        LOG("%d is sending barrier data (%d byes) to %d\n", instance->rank, count, child_rank);
-        assert(MIMPI_Send(data, count, child_rank, _TAG_BARRIER_DATA) == MIMPI_SUCCESS);
-    }
+inline static MIMPI_Retcode get_failing(MIMPI_Retcode a, MIMPI_Retcode b, MIMPI_Retcode c, MIMPI_Retcode d) {
+    if (a != MIMPI_SUCCESS)
+        return a;
+    if (b != MIMPI_SUCCESS)
+        return b;
+    if (c != MIMPI_SUCCESS)
+        return c;
+    if (d != MIMPI_SUCCESS)
+        return d;
+    return MIMPI_SUCCESS;
 }
 
-static MIMPI_Retcode internal_barrier(rank_t root, void *data, int count) {
+inline static MIMPI_Retcode get_failing2(MIMPI_Retcode a, MIMPI_Retcode b) {
+    if (a != MIMPI_SUCCESS)
+        return a;
+    if (b != MIMPI_SUCCESS)
+        return b;
+    return MIMPI_SUCCESS;
+}
+
+static MIMPI_Retcode internal_barrier() {
     LOG("%d is entering the barrier...\n", instance->rank);
 
-    MIMPI_Retcode status = MIMPI_SUCCESS;
     rank_t v = instance->rank + 1;
-    int parent = PARENT(v) - 1;
+    int lchild = LEFT(v) - 1, rchild = RIGHT(v) - 1, /*parent = (v == 16 ? 1 : PARENT(v)) - 1*/ parent = PARENT(v) - 1;
 
-    if (instance->rank == root) {
-        for (int i = 0; i < instance->world_size; ++i) {
-            if (i == root)
-                continue;
-            LOG("The root of the barrier (%d) is waiting for %d to enter.\n", root, i);
-            // TODO: odbierać od dowolnych, co jak i=0 wejdzie ostatnie?
-            MIMPI_Retcode ret = MIMPI_Recv(NULL, 0, i, _TAG_BARRIER_ENTER);
-            if (ret != MIMPI_SUCCESS)
-                status = ret;
-            LOG("The root of the barrier (%d) acknowledged that %d has entered the barrier or is offline (ret: %d).\n", root, i, ret);
+    MIMPI_Retcode status, lst, rst, lchst, rchst;
+    status = lst = rst = lchst = rchst = MIMPI_SUCCESS;
+
+    if (lchild < instance->world_size)
+        lst = MIMPI_Recv(&lchst, sizeof(MIMPI_Retcode), lchild, _TAG_BARRIER_ENTER);
+    if (rchild < instance->world_size)
+        rst = MIMPI_Recv(&rchst, sizeof(MIMPI_Retcode), rchild, _TAG_BARRIER_ENTER);
+
+    status = get_failing(lst, lchst, rst, rchst);
+
+    if (v != 1) {
+        MIMPI_Retcode pst = MIMPI_Send(&status, sizeof(MIMPI_Retcode), parent, _TAG_BARRIER_ENTER);
+        if (pst != MIMPI_SUCCESS)
+            status = pst;
+        else {
+            //TODO
+            MIMPI_Retcode ret = MIMPI_Recv(&pst, sizeof(MIMPI_Retcode), parent, _TAG_BARRIER_LEAVE);
+            status = get_failing2(get_failing2(ret, pst), status);
+
+            printf("%d ABBA Z PARENTA %d?? %d\n", v-1, status, parent);
+            fflush(stdout);
         }
-
-        if (root != 0)
-            propagate_barrier_data(0, &status, data, count);
     } else {
-        MIMPI_Send(NULL, 0, root, _TAG_BARRIER_ENTER);
-
-        int vparent = instance->rank == 0 ? root : parent;
-        MIMPI_Retcode ret = MIMPI_Recv(&status, sizeof(MIMPI_Retcode), vparent, _TAG_BARRIER_LEAVE);
-        LOG("%d has received the barrier leave notification.\n", instance->rank);
-        if (ret != MIMPI_SUCCESS)
-            status = ret;
-
-        if (data != NULL) {
-            LOG("%d is waiting for data from %d.\n", instance->rank, vparent);
-            assert(MIMPI_Recv(data, count, vparent, _TAG_BARRIER_DATA) == MIMPI_SUCCESS);
-        }
+//        if (instance->worl)
+// TODO: 0 wysyla do 15
     }
 
-    // propagate the messages down the tree
-    int lchild = LEFT(v) - 1, rchild = RIGHT(v) - 1;
-//    LOG("LEFT(%d) = %d, RIGHT = %d", v, lchild, rchild);
-    if (lchild != root && lchild < instance->world_size)
-        propagate_barrier_data(lchild, &status, data, count);
-    if (rchild != root && rchild < instance->world_size)
-        propagate_barrier_data(rchild, &status, data, count);
+    if (lchild < instance->world_size)
+        MIMPI_Send(&status, sizeof(MIMPI_Retcode), lchild, _TAG_BARRIER_LEAVE);
+    if (rchild < instance->world_size)
+        MIMPI_Send(&status, sizeof(MIMPI_Retcode), rchild, _TAG_BARRIER_LEAVE);
+
 
     LOG("%d is leaving the barrier with status %d...\n", instance->rank, status);
     return status;
-}
-
-inline static bool rank_exists(rank_t r) {
-    return r >= 0 && r < instance->world_size;
-}
-
-inline static bool is_ok(MIMPI_Retcode ret) {
-    return ret == MIMPI_SUCCESS;
-}
-
-inline static void swap(MIMPI_Retcode *a, MIMPI_Retcode *b) {
-    MIMPI_Retcode c = *a;
-    *a = *b;
-    *b = c;
-}
-
-static MIMPI_Retcode internal_reduce(    void const *send_data,
-                                         void *recv_data,
-                                         int count,
-                                         MIMPI_Op op,
-                                         int root_dest
-) {
-    const rank_t rank = instance->rank;
-    const int btag = barrier_tag(++instance->barrier_count);
-    LOG("%d is entering the reduction barrier...\n", rank);
-
-    uint8_t *data = safe_calloc(count, sizeof(*data));
-    uint8_t *buf = safe_calloc(count, sizeof(*buf));
-    assert(memcpy(data, send_data, count));
-
-    MIMPI_Retcode retl, retr, retp;
-    rank_t lch = LEFT(rank+1)-1, rch = RIGHT(rank+1)-1, par = PARENT(rank+1)-1;
-    retl = retr = retp = MIMPI_SUCCESS;
-
-    if (rank_exists(lch)) {
-        retl = MIMPI_Recv(buf, count, lch, btag);
-        if (is_ok(retl))
-            reduce(data, buf, op, count);
-    }
-    if (rank_exists(rch)) {
-        retr = MIMPI_Recv(buf, count, rch, btag);
-        if (is_ok(retr))
-            reduce(data, buf, op, count);
-    }
-
-    if (!is_ok(retr))
-        swap(&retr, &retl);
-    if (!is_ok(retl)) {
-        // TODO: dziecko failuje, wysyła do rodzica, rodzic failuje, wysyła do dziecka, w dziecku jest przerywane inne mimpi_recv
-        MIMPI_Send(&retl, sizeof(retl), lch, _TAG_CURRENT_TRANSFER_FAILED);
-        MIMPI_Send(&retl, sizeof(retl), rch, _TAG_CURRENT_TRANSFER_FAILED);
-
-        if (rank != 0)
-            // TODO: obsługa w MIMPI_Recv tagu current transfer failed
-            MIMPI_Send(&retl, sizeof(retl), par, _TAG_CURRENT_TRANSFER_FAILED);
-        return retl;
-    } else if (rank != 0) {
-        retp = MIMPI_Send(data, count, par, btag);
-        if (!is_ok(retp)) {
-            MIMPI_Send(&retp, sizeof(retp), lch, _TAG_CURRENT_TRANSFER_FAILED);
-            MIMPI_Send(&retp, sizeof(retp), rch, _TAG_CURRENT_TRANSFER_FAILED);
-
-            return retp;
-        }
-    }
-
-    if (rank != 0 && rank != root_dest) {
-        LOG("%d is waiting for leave notification\n", rank);
-        MIMPI_Retcode ret;
-        ASSERT_MIMPI_OK(MIMPI_Recv(&ret, sizeof(ret), par, _TAG_BARRIER_LEAVE));
-        MIMPI_Send(&ret, sizeof(ret), lch, btag);
-        MIMPI_Send(&ret, sizeof(ret), rch, btag);
-        LOG("%d has received the leave notification\n", rank);
-        return ret;
-    }
-
-    if (root_dest != 0) {
-        if (rank == 0) {
-            LOG("%d sending data to root %d\n", rank, root_dest);
-            MIMPI_Send(data, count, root_dest, btag);
-        } else if (root_dest == rank) {
-            MIMPI_Recv(data, count, 0, btag);
-            LOG("%d has received root data\n", rank);
-        }
-    }
-
-    if (rank == 0) {
-        MIMPI_Retcode ret = MIMPI_SUCCESS;
-        MIMPI_Send(&ret, sizeof(ret), lch, btag);
-        MIMPI_Send(&ret, sizeof(ret), rch, btag);
-    }
-
-    if (rank == root_dest)
-        memcpy(recv_data, data, count);
-    LOG("%d is leaving the reduction barrier\n", instance->rank);
-    return MIMPI_SUCCESS;
 }
 
 
@@ -705,16 +602,17 @@ MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) 
     assert((data == NULL && count == 0) || (count != 0 && data != NULL));
     if (validate_sendrecv_args(destination) != MIMPI_SUCCESS)
         return validate_sendrecv_args(destination);
-    if (!iface_is_open(&instance->ifaces[destination]))
-        return MIMPI_ERROR_REMOTE_FINISHED;
 
     pdu_seq_t seq = 0;
     int offset = 0;
     MIMPI_Retcode status = MIMPI_SUCCESS;
 
     pthread_mutex_lock(&instance->mutex);
+    if (!iface_is_open(&instance->ifaces[destination]))
+        return MIMPI_ERROR_REMOTE_FINISHED;
+
     MIMPI_If *iface = &instance->ifaces[destination];
-    mid_t next_mid = iface->next_mid++;
+    mid_t next_mid = iface->next_mid;
     pthread_mutex_unlock(&instance->mutex);
 
     do {
@@ -742,6 +640,14 @@ MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) 
         offset += chunk_size;
     } while (offset < count);
 
+    if (status == MIMPI_SUCCESS) {
+        // Required, because iface_is_open uses next_mid to determine
+        // if an interface is open!
+        pthread_mutex_lock(&instance->mutex);
+        ++iface->next_mid;
+        pthread_mutex_unlock(&instance->mutex);
+    }
+
     return status;
 }
 
@@ -756,7 +662,11 @@ MIMPI_Retcode MIMPI_Recv(void *data, int count, int source, int tag) {
     pthread_mutex_lock(&instance->mutex);
     MIMPI_Msg *msg = buffer_find_oldest_msg_by_tag(instance->inbound_buf, source, tag, count);
     if (msg == NULL) {
+//        LOG("Msg with src %d is null\n", source);
         if (!iface_is_open(&instance->ifaces[source])) {
+            // All interfaces are closed, and therefore the reading thread
+            // doesn't exist.
+//            LOG("Iface isn't open!", "");
             status = MIMPI_ERROR_REMOTE_FINISHED;
         } else {
             instance->pending_request = true;
@@ -766,16 +676,23 @@ MIMPI_Retcode MIMPI_Recv(void *data, int count, int source, int tag) {
 
             pthread_cond_wait(&instance->reader_event, &instance->mutex);
 
+
             msg = instance->req_response;
             status = instance->req_status;
+
+//            LOG("Received reader response: msg %p status %d for req from %d\n", msg, instance->req_status, source);
             reset_request();
         }
+    } else {
+//        LOG("Msg with src %d is not null!!\n", source);
     }
 
     pthread_mutex_unlock(&instance->mutex);
 
     if (status == MIMPI_SUCCESS) {
-        assert(count == msg->size);
+        assert(msg->src == source);
+        assert(msg->tag == tag);
+        assert(msg->size == count);
         // Even if count = 0, memcpy behaves correctly.
         memcpy(data, msg->data, count);
         buffer_del(msg);
@@ -787,29 +704,29 @@ MIMPI_Retcode MIMPI_Recv(void *data, int count, int source, int tag) {
 MIMPI_Retcode MIMPI_Barrier(void) {
     if (instance->world_size == 1)
         return MIMPI_SUCCESS;
-    LOG("%d has entered a barrier\n", instance->rank);
+//    LOG("%d has entered a barrier\n", instance->rank);
+//
+//    MIMPI_Retcode status = MIMPI_SUCCESS;
+//    if (instance->rank == 0) {
+//        for (int i = 1; i < instance->world_size; ++i) {
+//            MIMPI_Retcode ret = MIMPI_Recv(NULL, 0, i, _TAG_BARRIER_ENTER);
+//            if (ret != MIMPI_SUCCESS) {
+//                status = ret;
+//            }
+//        }
+//
+//        for (int i = 1; i < instance->world_size; ++i) {
+//            MIMPI_Send(&status, sizeof(MIMPI_Retcode), i, _TAG_BARRIER_LEAVE);
+//        }
+//    } else {
+//        status = MIMPI_Send(NULL, 0, 0, _TAG_BARRIER_ENTER);
+//        MIMPI_Retcode ret = MIMPI_Recv(&status, sizeof(MIMPI_Retcode), 0, _TAG_BARRIER_LEAVE);
+//        if (ret != MIMPI_SUCCESS) {
+//            status = ret;
+//        }
+//    }
 
-    MIMPI_Retcode status = MIMPI_SUCCESS;
-    if (instance->rank == 0) {
-        for (int i = 1; i < instance->world_size; ++i) {
-            MIMPI_Retcode ret = MIMPI_Recv(NULL, 0, i, _TAG_BARRIER_ENTER);
-            if (ret != MIMPI_SUCCESS) {
-                status = ret;
-            }
-        }
-
-        for (int i = 1; i < instance->world_size; ++i) {
-            MIMPI_Send(&status, sizeof(MIMPI_Retcode), i, _TAG_BARRIER_LEAVE);
-        }
-    } else {
-        status = MIMPI_Send(NULL, 0, 0, _TAG_BARRIER_ENTER);
-        MIMPI_Retcode ret = MIMPI_Recv(&status, sizeof(MIMPI_Retcode), 0, _TAG_BARRIER_LEAVE);
-        if (ret != MIMPI_SUCCESS) {
-            status = ret;
-        }
-    }
-
-    return status;
+    return internal_barrier();
 }
 
 MIMPI_Retcode MIMPI_Bcast(

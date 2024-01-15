@@ -88,7 +88,6 @@ typedef struct MIMPI_Instance {
     pthread_mutex_t mutex;
     pthread_cond_t reader_event;
     // requested message parameters
-    int finished_fd[2];
     bool pending_request;
     rank_t req_src;
     tag_t req_tag;
@@ -318,10 +317,9 @@ static void *inbound_iface_handler(void *arg) {
 
     while (!instance->finished) {
         FD_ZERO(&in_fds);
-        FD_SET(instance->finished_fd[0], &in_fds);
 
         pthread_mutex_lock(&instance->mutex);
-        int maxfd = max(fill_fdset(&in_fds), instance->finished_fd[0]);
+        int maxfd = fill_fdset(&in_fds);
         pthread_mutex_unlock(&instance->mutex);
 
         if (maxfd == 0) {
@@ -329,9 +327,11 @@ static void *inbound_iface_handler(void *arg) {
             break;
         }
 
-        LOG("Hanging on select...\n", "");
-        ASSERT_SYS_OK(select(maxfd + 1, &in_fds, NULL, NULL, NULL));
-        LOG("Post-select...\n", "");
+        int st = select(maxfd + 1, &in_fds, NULL, NULL, NULL);
+        if (st == -1) {
+            assert(instance->finished);
+            continue;
+        }
 
         int i = 0;
         FOR_IFACE_IT(iface, i) {
@@ -344,36 +344,46 @@ static void *inbound_iface_handler(void *arg) {
                 LOG("%d received EOF on %d\n", instance->rank, i);
                 pthread_mutex_lock(&instance->mutex);
                 free_iface(iface);
+
+                if (instance->pending_request && instance->req_src == i) {
+                    reset_request();
+                    instance->req_status = MIMPI_ERROR_REMOTE_FINISHED;
+
+                    pthread_cond_signal(&instance->reader_event);
+                }
+
                 pthread_mutex_unlock(&instance->mutex);
                 continue;
             }
 
-            LOG("PDU src=%d tag=%d id=%d seq=%d len=%d total_len=%d\n", pdu.src, pdu.tag, pdu.id, pdu.seq, pdu.length, pdu.total_length);
+//            LOG("PDU src=%d tag=%d id=%d seq=%d len=%d total_len=%d\n", pdu.src, pdu.tag, pdu.id, pdu.seq, pdu.length, pdu.total_length);
             assert(nbytes == sizeof(MIMPI_PDU));
             assert(pdu.src == i);
 
             pthread_mutex_lock(&instance->mutex);
             MIMPI_Msg *msg = buffer_put(instance->inbound_buf, &pdu);
-            if (instance->pending_request && i == instance->req_src
-                && pdu.tag == instance->req_tag && pdu.total_length == instance->req_count
-                && is_msg_ready(msg)) {
+//            LOG("requested:  src=%d tag=%d count=%d\n", instance->req_src, instance->req_tag, instance->req_count);
+            if (instance->pending_request && i == instance->req_src && (pdu.tag == instance->req_tag || instance->req_tag == MIMPI_ANY_TAG)
+                && pdu.total_length == instance->req_count && is_msg_ready(msg)) {
+//                LOG("Packet matches!\n", "");
                 instance->req_response = msg;
+                instance->pending_request = false;
 
                 pthread_cond_signal(&instance->reader_event);
             }
             pthread_mutex_unlock(&instance->mutex);
         }
-
-        // TODO: nie nadpisywać tej samej gotowej wiadomości kilka razy??
-        // Rs: signal reader_event
-        // Rs: zdobywa mutex
-        // Rs: nadpisuje wiadomość?
-        // R: zdobuwa mutex
-        // ^+-?
     }
 
-    LOG("Reader thread has finished.\n", "");
+    pthread_mutex_lock(&instance->mutex);
+    if (instance->pending_request) {
+        reset_request();
+        instance->req_status = MIMPI_ERROR_REMOTE_FINISHED;
+        pthread_cond_signal(&instance->reader_event);
+    }
+    pthread_mutex_unlock(&instance->mutex);
 
+    LOG("Reader thread has finished.\n", "");
     return NULL;
 }
 
@@ -384,10 +394,12 @@ static MIMPI_Retcode send_if(MIMPI_If *iface, MIMPI_PDU *pdu) {
 //    printf("%d sending from %d tag %d\n", nbytes, pdu->src, pdu->tag);
     if (nbytes == -1) {
         assert(errno == EBADF || errno == EPIPE);
-//        pthread_mutex_lock(&instance->buffer_mutex);
+
+        pthread_mutex_lock(&instance->mutex);
         if (iface_is_open(iface))
             free_iface(iface);
-//        pthread_mutex_unlock(&instance->buffer_mutex);
+        pthread_mutex_unlock(&instance->mutex);
+
         return MIMPI_ERROR_REMOTE_FINISHED;
     }
     ASSERT_SYS_OK(nbytes);
@@ -614,16 +626,6 @@ void make_instance(bool enable_deadlock_detection) {
     instance->inbound_buf = safe_calloc(1, sizeof(MIMPI_Msg_Buffer));
     buffer_init(instance->inbound_buf);
 
-    // channels
-    int ffds[2];
-    ASSERT_SYS_OK(channel(ffds));
-    ASSERT_SYS_OK(dup2(ffds[0], FD_READER_RE));
-    ASSERT_SYS_OK(dup2(ffds[1], FD_READER_WE));
-    ASSERT_SYS_OK(close(ffds[0]));
-    ASSERT_SYS_OK(close(ffds[1]));
-    instance->finished_fd[0] = FD_READER_RE;
-    instance->finished_fd[1] = FD_READER_WE;
-
     // mutexes
     ASSERT_ZERO(pthread_mutex_init(&instance->mutex, NULL));
     ASSERT_ZERO(pthread_cond_init(&instance->reader_event, NULL));
@@ -643,9 +645,7 @@ void free_instance(MIMPI_Instance **mimpiInstance) {
         pthread_mutex_unlock(&inst->mutex);
     }
 
-    LOG("WTF\n", "");
     ASSERT_ZERO(pthread_join(instance->reader_thread, NULL));
-    LOG("WTF-POST\n", "");
 
     // destroy mutexes
     pthread_mutex_destroy(&inst->mutex);
@@ -677,11 +677,12 @@ void MIMPI_Init(bool enable_deadlock_detection) {
 }
 
 void MIMPI_Finalize() {
-    LOG("Finalizing %d...\n", instance->rank);
+    int rank = instance->rank;
+    LOG("Finalizing %d...\n", rank);
     free_instance(&instance);
 
     channels_finalize();
-    LOG("Process %d has finished.\n", instance->rank);
+    LOG("Process %d has finished.\n", rank);
 }
 
 int MIMPI_World_size() {
@@ -703,10 +704,10 @@ MIMPI_Retcode MIMPI_Send(void const *data, int count, int destination, int tag) 
     int offset = 0;
     MIMPI_Retcode status = MIMPI_SUCCESS;
 
-//    pthread_mutex_lock(&instance->buffer_mutex);
+    pthread_mutex_lock(&instance->mutex);
     MIMPI_If *iface = &instance->ifaces[destination];
     mid_t next_mid = iface->next_mid;
-//    pthread_mutex_unlock(&instance->buffer_mutex);
+    pthread_mutex_unlock(&instance->mutex);
 
     do {
         int chunk_size = min(MAX_PDU_DATA_LENGTH, count - offset);
